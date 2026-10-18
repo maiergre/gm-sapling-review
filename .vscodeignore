@@ -8,3 +8,5 @@ tsconfig.json
 build.mjs
 **/*.map
 AGENTS.md
+build-and-install.sh
+install-latest.py

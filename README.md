@@ -2,7 +2,15 @@
 
 A separate VS Code extension for reviewing Sapling diffs, with syntax highlighting and durable local comments. Source and build files live in this directory. 
 
-## Install and run
+## Install the latest release
+
+Download the versioned VSIX from the [latest GitHub release](https://github.com/maiergre/gm-sapling-review/releases/latest) and run **Extensions: Install from VSIX…** in VS Code.
+
+Sapling's `sl` must be installed where the workspace runs. Run **Developer: Reload Window** after installing.
+
+In a Remote SSH window, use **Extensions: Install from VSIX…** in the connected window to install on the remote host. A local installation does not also install the remote extension.
+
+## Build and run from source
 
 Requires Node.js 24 LTS (24.15 or newer) to build and test, VS Code 1.86 or newer, and `sl` on PATH (or set `gmSapling.commandPath`).
 
@@ -14,6 +22,8 @@ npm run build
 npm run package
 code --install-extension gm-sapling-review-0.1.2.vsix --force
 ```
+
+For subsequent local updates, run `./build-and-install.sh`. It packages the current version and installs it into VS Code with `--force`; run `npm ci` first on a fresh checkout. Then run **Developer: Reload Window** in VS Code. The script can be invoked from any working directory.
 
 For development, run `npm run build`, open this directory in VS Code, and press F5. In the Extension Development Host, open your project and run **GM Sapling Review: Open Diff** from the Command Palette.
 
