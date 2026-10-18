@@ -1,0 +1,1056 @@
+:root {
+  color-scheme: light dark;
+  --review-border: var(
+    --vscode-panel-border,
+    var(--vscode-editorWidget-border, #8b949e55)
+  );
+  --review-muted: var(--vscode-descriptionForeground, #8b949e);
+  --review-surface: var(
+    --vscode-editorWidget-background,
+    var(--vscode-editor-background, #1f2329)
+  );
+  --review-surface-raised: var(
+    --vscode-sideBar-background,
+    var(--vscode-editorWidget-background, #24292f)
+  );
+  --review-input: var(
+    --vscode-input-background,
+    var(--vscode-editor-background, #1f2329)
+  );
+  --review-input-border: var(--vscode-input-border, var(--review-border));
+  --review-fg: var(--vscode-editor-foreground, #e6edf3);
+  --review-link: var(--vscode-textLink-foreground, #3794ff);
+  --review-focus: var(--vscode-focusBorder, #3794ff);
+  --review-danger: var(--vscode-errorForeground, #f85149);
+  --review-warning: var(--vscode-editorWarning-foreground, #d29922);
+  --review-selected: color-mix(
+    in srgb,
+    var(--vscode-focusBorder, #3794ff) 17%,
+    transparent
+  );
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0 1rem 3rem;
+  background: var(--vscode-editor-background, #1f2329);
+  color: var(--review-fg);
+  font-family: var(
+    --vscode-font-family,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif
+  );
+  font-size: var(--vscode-font-size, 13px);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button,
+select,
+input,
+textarea {
+  color: var(--vscode-input-foreground, var(--review-fg));
+}
+
+button,
+select {
+  cursor: pointer;
+}
+
+button {
+  border: 1px solid var(--review-input-border);
+  border-radius: 3px;
+  background: var(
+    --vscode-button-secondaryBackground,
+    var(--review-surface-raised)
+  );
+  color: var(--vscode-button-secondaryForeground, var(--review-fg));
+  padding: 0.25rem 0.6rem;
+}
+
+button:hover {
+  background: var(
+    --vscode-button-secondaryHoverBackground,
+    var(--review-selected)
+  );
+}
+
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+a:focus-visible {
+  outline: 1px solid var(--review-focus);
+  outline-offset: 1px;
+}
+
+button:disabled {
+  cursor: default;
+  opacity: 0.65;
+}
+
+#toolbar {
+  position: sticky;
+  z-index: 20;
+  top: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  flex-direction: column;
+  align-items: stretch;
+  min-height: 3rem;
+  margin: 0 -1rem 0.65rem;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--review-border);
+  background: color-mix(
+    in srgb,
+    var(--vscode-editor-background, #1f2329) 94%,
+    transparent
+  );
+  backdrop-filter: blur(8px);
+}
+
+.review-toolbar-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
+.review-title {
+  margin-right: 0.35rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.review-primary-action,
+.review-save-button {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, white);
+  border-color: transparent;
+}
+
+.review-primary-action:hover,
+.review-save-button:hover {
+  background: var(--vscode-button-hoverBackground, #1177bb);
+}
+
+.review-control-label {
+  color: var(--review-muted);
+  margin-left: 0.25rem;
+}
+
+#review-preset,
+.review-command-input {
+  min-height: 1.75rem;
+  padding: 0.2rem 0.45rem;
+  border: 1px solid var(--review-input-border);
+  border-radius: 3px;
+  background: var(--review-input);
+}
+
+.review-command-input {
+  width: min(31rem, 40vw);
+  min-width: 12rem;
+  font-family: var(
+    --vscode-editor-font-family,
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace
+  );
+  font-size: 0.92em;
+}
+
+.review-view-toggle {
+  display: inline-flex;
+  margin-left: auto;
+}
+
+.review-view-toggle button {
+  border-radius: 0;
+}
+
+.review-view-toggle button:first-child {
+  border-radius: 3px 0 0 3px;
+}
+
+.review-view-toggle button:last-child {
+  border-radius: 0 3px 3px 0;
+  border-left-width: 0;
+}
+
+.review-view-toggle button.selected {
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, white);
+}
+
+#status {
+  min-height: 1.5rem;
+  padding: 0.2rem 0;
+  color: var(--review-muted);
+  overflow-wrap: anywhere;
+}
+
+#status[data-kind="error"] {
+  color: var(--review-danger);
+}
+
+.review-toc {
+  display: block;
+  margin: 0.3rem 0 1rem;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid var(--review-border);
+  border-radius: 4px;
+  background: var(--review-surface-raised);
+}
+
+.review-toc > summary,
+.review-toc-summary {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  cursor: pointer;
+  color: var(--review-fg);
+  font-weight: 600;
+  list-style: none;
+}
+
+.review-toc > summary::-webkit-details-marker,
+.review-toc-summary::-webkit-details-marker {
+  display: none;
+}
+
+.review-toc > summary::before,
+.review-toc-summary::before {
+  width: 0.8rem;
+  color: var(--review-muted);
+  content: "▸";
+  font-size: 0.9em;
+}
+
+.review-toc[open] > summary::before,
+.review-toc.is-open > .review-toc-summary::before {
+  content: "▾";
+}
+
+.review-toc-heading {
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.review-toc-list {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0.55rem 0 0;
+  padding: 0 0 0 1.3rem;
+  list-style: none;
+}
+
+.review-toc-list li {
+  min-width: 0;
+}
+
+.review-toc-list details {
+  padding-left: 0.8rem;
+  border-left: 1px solid var(--review-border);
+}
+
+.review-toc-list summary {
+  padding: 0.12rem 0.25rem;
+  cursor: pointer;
+  color: var(--review-link);
+}
+
+.review-toc-list summary:hover,
+.review-toc-list summary:focus-visible {
+  background: var(--review-selected);
+}
+
+.review-toc-list .review-toc-children {
+  margin: 0.15rem 0 0.2rem;
+  padding-left: 1.1rem;
+  border-left: 1px solid var(--review-border);
+}
+
+.review-repo-controls,
+.review-review-controls,
+.review-repository-controls,
+.review-command-controls {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.review-repo-controls,
+.review-repository-controls {
+  min-width: 0;
+}
+
+.review-review-controls {
+  margin-left: auto;
+}
+
+.review-control-group,
+.review-repo-control,
+.review-review-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.review-control-group > label,
+.review-repo-control > label,
+.review-review-control > label {
+  color: var(--review-muted);
+}
+
+.review-repo-select,
+.review-repo-input,
+.review-review-select,
+#review-repo,
+#review-review,
+.review-review-input {
+  min-height: 1.75rem;
+  padding: 0.2rem 0.45rem;
+  border: 1px solid var(--review-input-border);
+  border-radius: 3px;
+  background: var(--review-input);
+}
+
+.review-repo-select,
+.review-review-select {
+  color: var(--vscode-input-foreground, var(--review-fg));
+}
+
+a {
+  color: var(--review-link);
+}
+
+.review-diff-output {
+  min-width: 0;
+}
+
+.review-empty-state,
+.review-diff-fallback {
+  margin: 1rem 0;
+  padding: 1.25rem;
+  border: 1px dashed var(--review-border);
+  color: var(--review-muted);
+}
+
+.review-diff-fallback {
+  overflow: auto;
+  white-space: pre;
+  font-family: var(
+    --vscode-editor-font-family,
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace
+  );
+}
+
+/* Keep diff2html's generated markup, but supply every palette token from
+   VS Code. Both d2h schemes share these tokens so OS and editor themes cannot
+   disagree (including changed rows, word highlights and empty split cells). */
+.d2h-wrapper {
+  --d2h-bg-color: var(--vscode-editor-background, #1f2329);
+  --d2h-border-color: var(--review-border);
+  --d2h-line-border-color: var(--review-border);
+  --d2h-dim-color: var(--review-muted);
+  --d2h-file-header-bg-color: var(--review-surface-raised);
+  --d2h-file-header-border-color: var(--review-border);
+  --d2h-empty-placeholder-bg-color: var(--d2h-bg-color);
+  --d2h-empty-placeholder-border-color: transparent;
+  --d2h-selected-color: var(--review-selected);
+  --d2h-ins-bg-color: color-mix(
+    in srgb,
+    var(--vscode-testing-iconPassed, #3fb950) 14%,
+    var(--d2h-bg-color)
+  );
+  --d2h-del-bg-color: color-mix(
+    in srgb,
+    var(--vscode-testing-iconFailed, #f85149) 14%,
+    var(--d2h-bg-color)
+  );
+  --d2h-ins-border-color: var(--review-border);
+  --d2h-del-border-color: var(--review-border);
+  --d2h-ins-highlight-bg-color: color-mix(
+    in srgb,
+    var(--vscode-testing-iconPassed, #3fb950) 30%,
+    var(--d2h-bg-color)
+  );
+  --d2h-del-highlight-bg-color: color-mix(
+    in srgb,
+    var(--vscode-testing-iconFailed, #f85149) 30%,
+    var(--d2h-bg-color)
+  );
+  --d2h-ins-label-color: var(
+    --vscode-gitDecoration-addedResourceForeground,
+    #3fb950
+  );
+  --d2h-del-label-color: var(
+    --vscode-gitDecoration-deletedResourceForeground,
+    #f85149
+  );
+  --d2h-change-del-color: var(--d2h-del-bg-color);
+  --d2h-change-ins-color: var(--d2h-ins-bg-color);
+  --d2h-info-bg-color: var(--review-surface-raised);
+  --d2h-info-border-color: var(--review-border);
+  --d2h-change-label-color: var(--review-warning);
+  --d2h-moved-label-color: var(--review-link);
+  --d2h-dark-color: var(--review-fg);
+  --d2h-dark-bg-color: var(--d2h-bg-color);
+  --d2h-dark-border-color: var(--d2h-border-color);
+  --d2h-dark-line-border-color: var(--d2h-line-border-color);
+  --d2h-dark-dim-color: var(--d2h-dim-color);
+  --d2h-dark-file-header-bg-color: var(--d2h-file-header-bg-color);
+  --d2h-dark-file-header-border-color: var(--d2h-file-header-border-color);
+  --d2h-dark-empty-placeholder-bg-color: var(--d2h-empty-placeholder-bg-color);
+  --d2h-dark-empty-placeholder-border-color: var(
+    --d2h-empty-placeholder-border-color
+  );
+  --d2h-dark-selected-color: var(--d2h-selected-color);
+  --d2h-dark-ins-bg-color: var(--d2h-ins-bg-color);
+  --d2h-dark-del-bg-color: var(--d2h-del-bg-color);
+  --d2h-dark-ins-border-color: var(--d2h-ins-border-color);
+  --d2h-dark-del-border-color: var(--d2h-del-border-color);
+  --d2h-dark-ins-highlight-bg-color: var(--d2h-ins-highlight-bg-color);
+  --d2h-dark-del-highlight-bg-color: var(--d2h-del-highlight-bg-color);
+  --d2h-dark-ins-label-color: var(--d2h-ins-label-color);
+  --d2h-dark-del-label-color: var(--d2h-del-label-color);
+  --d2h-dark-change-del-color: var(--d2h-change-del-color);
+  --d2h-dark-change-ins-color: var(--d2h-change-ins-color);
+  --d2h-dark-info-bg-color: var(--d2h-info-bg-color);
+  --d2h-dark-info-border-color: var(--d2h-info-border-color);
+  --d2h-dark-change-label-color: var(--d2h-change-label-color);
+  --d2h-dark-moved-label-color: var(--d2h-moved-label-color);
+  background: var(--d2h-bg-color);
+  color: var(--review-fg);
+}
+
+.d2h-file-wrapper {
+  scroll-margin-top: 7rem;
+  margin-bottom: 1.1rem;
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.d2h-file-header {
+  align-items: center;
+  gap: 0.45rem;
+  height: auto;
+  min-height: 2.4rem;
+  padding: 0.4rem 0.65rem;
+  color: var(--review-fg);
+  font-family: inherit;
+}
+
+.d2h-file-name-wrapper {
+  min-width: 0;
+}
+.d2h-file-name {
+  color: var(--review-fg);
+}
+.d2h-tag {
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+.d2h-file-diff {
+  overflow-x: auto;
+}
+.d2h-file-side-diff {
+  overflow-x: auto;
+  min-width: 0;
+  width: 50%;
+}
+
+.d2h-file-side-diff:first-child {
+  border-right: 1px solid var(--review-border);
+}
+
+/* Use actual table cells for gutters. The upstream absolute gutters rely on
+   matching code padding; mixing relative gutters with that padding doubled
+   the indent and squeezed four-digit numbers onto separate rows. */
+.d2h-diff-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(
+    --vscode-editor-font-family,
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace
+  );
+  font-size: var(--vscode-editor-font-size, 13px);
+  line-height: 22px;
+}
+
+.d2h-diff-table td {
+  padding-top: 0;
+  padding-bottom: 0;
+  vertical-align: top;
+}
+.d2h-code-linenumber,
+.d2h-code-side-linenumber {
+  display: table-cell;
+  position: static;
+  direction: ltr;
+  width: 1%;
+  padding: 0 6px;
+  white-space: nowrap;
+  overflow: visible;
+  text-overflow: clip;
+  border-width: 0 1px 0 0;
+  user-select: none;
+}
+.d2h-code-linenumber::after,
+.d2h-code-side-linenumber::after {
+  content: none;
+}
+
+.line-num1,
+.line-num2 {
+  float: none;
+  display: inline-block;
+  position: relative;
+  width: calc(6ch + 18px);
+  min-width: calc(6ch + 18px);
+  padding: 0 18px 0 0;
+  overflow: visible;
+  text-overflow: clip;
+  text-align: right;
+  vertical-align: top;
+}
+.d2h-code-side-linenumber {
+  /* Position the comment button without changing the cell's table layout. */
+  position: relative;
+  min-width: calc(6ch + 24px);
+  padding-right: 24px;
+  text-align: right;
+}
+.d2h-code-line,
+.d2h-code-side-line {
+  display: block;
+  width: auto;
+  min-width: 0;
+  padding: 0 12px;
+  line-height: inherit;
+}
+.d2h-code-line-ctn {
+  width: auto;
+  min-height: 22px;
+  line-height: inherit;
+  color: var(--review-fg);
+}
+.d2h-code-line-prefix {
+  color: var(--review-muted);
+}
+.d2h-info {
+  color: var(--review-muted);
+}
+.d2h-code-side-emptyplaceholder,
+.d2h-emptyplaceholder {
+  border-color: transparent;
+}
+
+/* Empty split cells still need the same gutter rule as populated cells. The
+   generic placeholder rule above applies to both the code and number cells,
+   so restore the rule only on the number-cell side of that pair. */
+.d2h-code-linenumber.d2h-emptyplaceholder,
+.d2h-code-side-linenumber.d2h-emptyplaceholder,
+.d2h-code-side-linenumber.d2h-code-side-emptyplaceholder {
+  border-right-color: var(--review-border);
+}
+
+.d2h-code-linenumber.d2h-info,
+.d2h-code-side-linenumber.d2h-info {
+  border-right-color: var(--review-border);
+}
+
+/* Markdown changes are easier to scan as a changed line. Diff2Html's word
+   renderer otherwise leaves a rounded box around every edited word. */
+.d2h-file-wrapper[data-lang="md"] .d2h-code-line ins,
+.d2h-file-wrapper[data-lang="md"] .d2h-code-line del,
+.d2h-file-wrapper[data-lang="markdown"] .d2h-code-line ins,
+.d2h-file-wrapper[data-lang="markdown"] .d2h-code-line del,
+.d2h-file-wrapper[data-lang="mdx"] .d2h-code-line ins,
+.d2h-file-wrapper[data-lang="mdx"] .d2h-code-line del,
+.d2h-file-wrapper[data-lang="md"] .d2h-code-side-line ins,
+.d2h-file-wrapper[data-lang="md"] .d2h-code-side-line del,
+.d2h-file-wrapper[data-lang="markdown"] .d2h-code-side-line ins,
+.d2h-file-wrapper[data-lang="markdown"] .d2h-code-side-line del,
+.d2h-file-wrapper[data-lang="mdx"] .d2h-code-side-line ins,
+.d2h-file-wrapper[data-lang="mdx"] .d2h-code-side-line del {
+  display: inline;
+  margin-top: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.review-thread-row > td {
+  padding: 0.4rem 0.65rem 0.65rem;
+  border-top: 1px solid var(--review-focus);
+  background: var(--review-surface-raised);
+}
+
+.review-thread-row .review-comment,
+.review-thread-row .review-composer {
+  margin: 0;
+  border: 1px solid var(--review-border);
+  border-radius: 5px;
+  background: var(--review-surface-raised);
+  box-shadow: 0 1px 2px color-mix(in srgb, #000 20%, transparent);
+}
+
+.review-thread-row .review-composer {
+  border-color: var(--review-focus);
+}
+
+.review-line-anchor {
+  cursor: pointer;
+}
+
+.review-line-anchor:hover,
+.review-line-anchor:focus-within {
+  color: var(--review-fg);
+  background: var(--review-selected);
+}
+
+.review-line-action {
+  position: absolute;
+  z-index: 2;
+  right: 0.05rem;
+  top: 50%;
+  width: 1.15rem;
+  height: 1.15rem;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 0;
+  border-radius: 2px;
+  background: var(--vscode-button-background, #0e639c);
+  color: var(--vscode-button-foreground, white);
+  line-height: 1;
+  opacity: 0;
+}
+
+.review-line-anchor:hover .review-line-action,
+.review-line-anchor:focus-within .review-line-action {
+  opacity: 1;
+}
+
+.review-line-action:focus-visible {
+  opacity: 1;
+}
+
+.review-selected-line {
+  background: var(--review-selected) !important;
+  box-shadow: inset 2px 0 var(--review-focus);
+}
+
+.review-file-toggle {
+  flex: 0 0 auto;
+  width: 1.5rem;
+  padding: 0.1rem;
+  border: 0;
+  background: transparent;
+  color: var(--review-muted);
+}
+
+.review-file-toggle:hover {
+  background: var(--review-selected);
+}
+
+.review-collapsed .d2h-file-diff,
+.review-collapsed .d2h-files-diff {
+  display: none;
+}
+
+#comments {
+  max-width: 72rem;
+  margin-top: 1.5rem;
+}
+
+.review-comments-heading {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.65rem;
+  border-bottom: 1px solid var(--review-border);
+}
+
+.review-comments-heading h2 {
+  margin: 0 0 0.45rem;
+  font-size: 1.05rem;
+}
+
+.review-comment-count {
+  min-width: 1.35rem;
+  padding: 0.05rem 0.35rem;
+  border-radius: 1rem;
+  background: var(--review-surface-raised);
+  color: var(--review-muted);
+  text-align: center;
+}
+
+.review-comments-empty {
+  color: var(--review-muted);
+}
+
+.review-composer,
+.review-comment {
+  margin: 0.65rem 0;
+  padding: 0.75rem;
+  border: 1px solid var(--review-border);
+  border-radius: 4px;
+  background: var(--review-surface-raised);
+}
+
+.review-composer {
+  border-color: var(--review-focus);
+}
+
+.review-composer-heading,
+.review-comment-header {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.55rem;
+  margin-bottom: 0.5rem;
+  color: var(--review-muted);
+  font-size: 0.92em;
+}
+
+.review-comment-location {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--review-link);
+  font-family: var(
+    --vscode-editor-font-family,
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace
+  );
+  font-size: inherit;
+  text-align: left;
+}
+
+.review-comment-location:hover {
+  text-decoration: underline;
+}
+
+.review-comment-quote {
+  max-height: 8rem;
+  margin: 0 0 0.55rem;
+  padding: 0.45rem 0.6rem;
+  overflow: auto;
+  border-left: 2px solid var(--review-border);
+  color: var(--review-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.review-composer textarea,
+.review-comment textarea {
+  display: block;
+  width: 100%;
+  resize: vertical;
+  padding: 0.5rem;
+  border: 1px solid var(--review-input-border);
+  border-radius: 3px;
+  background: var(--review-input);
+}
+
+.review-comment-body {
+  margin: 0 0 0.6rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.review-comment-actions {
+  display: flex;
+  gap: 0.45rem;
+  justify-content: flex-end;
+  margin-top: 0.55rem;
+}
+
+.review-outdated-label {
+  padding: 0.15rem 0.35rem;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--review-warning) 16%, transparent);
+  color: var(--review-warning);
+  font-size: 0.9em;
+}
+
+.review-comment.outdated {
+  opacity: 0.67;
+}
+
+.review-comment.outdated:hover,
+.review-comment.outdated:focus-within {
+  opacity: 0.95;
+}
+
+@media (max-width: 760px) {
+  body {
+    padding-right: 0.5rem;
+    padding-left: 0.5rem;
+  }
+
+  #toolbar {
+    margin-right: -0.5rem;
+    margin-left: -0.5rem;
+    padding-right: 0.5rem;
+    padding-left: 0.5rem;
+  }
+
+  .review-title {
+    width: 100%;
+  }
+
+  .review-command-input {
+    flex: 1 1 12rem;
+    width: auto;
+  }
+
+  .review-view-toggle {
+    margin-left: 0;
+  }
+}
+
+/* Review threads occupy equal vertical space in both panes, including the
+   gutter on the side without a comment. */
+.review-thread-spacer > td {
+  background: var(--d2h-bg-color);
+  padding-top: 0;
+  padding-bottom: 0;
+}
+.review-thread-spacer > .d2h-code-side-linenumber {
+  border-right: 1px solid var(--review-border);
+}
+
+.review-comment-index {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 1rem;
+}
+.review-comment-index li {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid var(--review-border);
+}
+.review-comment-jump {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: transparent;
+  border-color: transparent;
+}
+.review-comment-index-location {
+  font-family: var(--vscode-editor-font-family, monospace);
+  overflow-wrap: anywhere;
+  color: var(--vscode-textLink-foreground);
+}
+.review-comment-preview {
+  color: var(--vscode-descriptionForeground);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.review-comment:focus {
+  outline: 2px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+.review-comment {
+  scroll-margin-top: 8rem;
+}
+
+.review-manager-backdrop {
+  position: fixed;
+  z-index: 50;
+  inset: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 8vh 1rem 2rem;
+  overflow: auto;
+  background: color-mix(in srgb, #000 48%, transparent);
+}
+
+.review-manager-dialog {
+  width: min(52rem, 100%);
+  max-height: 84vh;
+  overflow: auto;
+  padding: 1rem;
+  border: 1px solid var(--review-border);
+  border-radius: 6px;
+  background: var(--review-surface);
+  box-shadow: 0 0.75rem 3rem color-mix(in srgb, #000 42%, transparent);
+}
+
+.review-manager-header,
+.review-manager-controls,
+.review-manager-item,
+.review-manager-item-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.review-manager-header {
+  justify-content: space-between;
+  padding-bottom: 0.75rem;
+  border-bottom: 1px solid var(--review-border);
+}
+
+.review-manager-header h2 {
+  margin: 0;
+  font-size: 1.1rem;
+}
+
+.review-manager-repository {
+  margin: 0.25rem 0 0;
+  color: var(--review-muted);
+  overflow-wrap: anywhere;
+}
+
+.review-manager-controls {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 0.8rem 0;
+}
+
+.review-manager-controls label {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: var(--review-muted);
+}
+
+.review-manager-search {
+  width: min(24rem, 60vw);
+  min-height: 1.75rem;
+  padding: 0.25rem 0.45rem;
+  border: 1px solid var(--review-input-border);
+  border-radius: 3px;
+  background: var(--review-input);
+}
+
+.review-manager-delete-all,
+.review-danger-action {
+  color: var(--review-danger);
+}
+
+.review-manager-list {
+  display: grid;
+  gap: 0.45rem;
+}
+
+.review-manager-item {
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 0.65rem 0.7rem;
+  border: 1px solid var(--review-border);
+  border-radius: 4px;
+  background: var(--review-surface-raised);
+}
+
+.review-manager-item-details {
+  display: grid;
+  min-width: 0;
+  gap: 0.2rem;
+}
+
+.review-manager-item-name {
+  overflow-wrap: anywhere;
+}
+
+.review-manager-current {
+  width: fit-content;
+  padding: 0.1rem 0.35rem;
+  border-radius: 3px;
+  background: var(--review-selected);
+  color: var(--review-link);
+  font-size: 0.9em;
+}
+
+.review-manager-item.is-current {
+  border-color: var(--review-focus);
+}
+
+.review-manager-item-metadata,
+.review-manager-empty {
+  color: var(--review-muted);
+}
+
+.review-manager-item-actions {
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+
+@media (max-width: 760px) {
+  .review-manager-backdrop {
+    padding: 1rem 0.5rem;
+  }
+
+  .review-manager-dialog {
+    max-height: 90vh;
+  }
+
+  .review-manager-item-actions {
+    width: 100%;
+    margin-left: 0;
+  }
+}
+
+.review-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.9rem;
+  min-height: 1.9rem;
+}
+
+.review-file-diffstat {
+  display: inline-flex;
+  gap: 0.5rem;
+  margin-left: auto;
+  flex-shrink: 0;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.9em;
+}
+.review-lines-added {
+  color: var(--vscode-gitDecoration-addedResourceForeground, #2ea043);
+}
+.review-lines-deleted {
+  color: var(--vscode-gitDecoration-deletedResourceForeground, #f85149);
+}

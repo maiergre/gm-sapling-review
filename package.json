@@ -1,0 +1,77 @@
+{
+  "name": "gm-sapling-review",
+  "displayName": "Sapling Review",
+  "description": "Syntax-highlighted Sapling diffs with persistent local review comments.",
+  "version": "0.1.2",
+  "publisher": "gregor",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.86.0"
+  },
+  "categories": [
+    "SCM Providers"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onWebviewPanel:gmSapling.review"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    }
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "gmSapling.review",
+        "title": "GM Sapling Review: Open Diff"
+      },
+      {
+        "command": "gmSapling.custom",
+        "title": "GM Sapling Review: Run Custom Diff Command"
+      }
+    ],
+    "configuration": {
+      "title": "Sapling Review",
+      "properties": {
+        "gmSapling.commandPath": {
+          "type": "string",
+          "default": "sl",
+          "description": "Path to the Sapling executable."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/*.test.ts",
+    "vscode:prepublish": "npm run check && npm run build",
+    "package": "vsce package --no-dependencies",
+    "format": "prettier --write src webview test build.mjs package.json tsconfig.json .vscode",
+    "test:visual": "npm run build && tsx --test test/visual/*.test.ts"
+  },
+  "dependencies": {
+    "diff2html": "^3.4.56",
+    "highlight.js": "^11.11.1"
+  },
+  "devDependencies": {
+    "@types/jsdom": "^30.0.0",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.86.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.25.0",
+    "jsdom": "^30.1.3",
+    "playwright-core": "^1.64.1",
+    "prettier": "^3.9.10",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maiergre/gm-vscode-sapling.git"
+  }
+}
