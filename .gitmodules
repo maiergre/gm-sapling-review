@@ -1,0 +1,3 @@
+[submodule "sapling"]
+	path = sapling
+	url = https://github.com/facebook/sapling.git
