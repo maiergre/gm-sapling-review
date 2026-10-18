@@ -1,6 +1,6 @@
 # Sapling Review
 
-A separate VS Code extension for reviewing Sapling diffs, with syntax highlighting and durable local comments. Source and build files live in this directory; `sapling/` is an unchanged reference submodule.
+A separate VS Code extension for reviewing Sapling diffs, with syntax highlighting and durable local comments. Source and build files live in this directory. 
 
 ## Install and run
 
@@ -50,11 +50,8 @@ The extension version stays at **0.1.2** during these iterations. Reinstall the 
 
 Refreshing compares each comment's original source text against the same side and line range of the new patch. Changed, moved, or missing ranges are marked **outdated**, including comments on files no longer present. This deliberately conservative check does not silently relocate comments. Preset diffs refresh on editor saves; use **Refresh** for external changes and custom commands.
 
-## Relationship to upstream
 
-GM Sapling Review uses and adapts MIT-licensed material from Meta's Sapling addons. It includes modifications and additions by Gregor Maier, also under MIT; see [LICENSE](LICENSE) for attribution. Sapling's main project has a separate GPL-2.0 license, while its addons and VS Code extension have their own MIT licenses.
-
-This is a review-focused companion, with its own command IDs. Keep the official Sapling SCM extension installed for smartlog, SCM status, commit/amend, blame, worktrees, remote review integrations, and upstream context expansion. Those features are not copied into this extension. The three preset revsets match `sapling/addons/shared/Comparison.ts`. The reference already supports syntax highlighting and split/inline views; this implementation uses diff2html with highlight.js and adds the local review workflow and recursive repository discovery.
+This is a review-focused companion, with its own command IDs. Keep the official Sapling SCM extension installed for smartlog, SCM status, commit/amend, blame, worktrees, remote review integrations, and upstream context expansion. Those features are not copied into this extension. The three preset revsets match [upstream comparison definitions](https://github.com/facebook/sapling/blob/79071c2a3ea20c36ed71332608535e5801101bba/addons/shared/Comparison.ts). The [upstream extension](https://github.com/facebook/sapling/tree/79071c2a3ea20c36ed71332608535e5801101bba/addons/vscode) already supports syntax highlighting and split/inline views; this implementation uses diff2html with highlight.js and adds the local review workflow and recursive repository discovery.
 
 ## Validation
 

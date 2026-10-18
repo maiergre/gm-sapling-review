@@ -1,11 +1,10 @@
-sapling/**
 node_modules/**
 src/**
 webview/**
 test/**
 .vscode/**
 .sl/**
-.gitmodules
 tsconfig.json
 build.mjs
 **/*.map
+AGENTS.md
