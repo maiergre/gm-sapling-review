@@ -102,14 +102,11 @@ test("webview renders highlighted diffs, preserves names, selects ranges, saves 
     );
     preset.value = "stack";
     preset.dispatchEvent(new b.w.Event("change"));
-    assert.equal(
-      command.value,
-      "sl diff --git --rev ancestor(.,interestingmaster())",
-    );
+    assert.equal(command.value, "--rev ancestor(.,interestingmaster())");
     assert.deepEqual(b.messages.at(-1), {
       type: "refresh",
       choice: "stack",
-      command: "sl diff --git --rev ancestor(.,interestingmaster())",
+      command: "--rev ancestor(.,interestingmaster())",
     });
     const beforeCustom = b.messages.length;
     preset.value = "custom";
@@ -121,7 +118,7 @@ test("webview renders highlighted diffs, preserves names, selects ranges, saves 
     );
     command.dispatchEvent(new b.w.MouseEvent("click", { bubbles: true }));
     assert.equal(preset.value, "custom");
-    command.value = "sl diff --git --rev abc123 --include src/app.ts";
+    command.value = "--rev abc123 --include src/app.ts";
     command.dispatchEvent(new b.w.Event("input"));
     b.w.document
       .querySelector<HTMLButtonElement>(".review-refresh-button")!
@@ -129,7 +126,7 @@ test("webview renders highlighted diffs, preserves names, selects ranges, saves 
     assert.deepEqual(b.messages.at(-1), {
       type: "refresh",
       choice: "custom",
-      command: "sl diff --git --rev abc123 --include src/app.ts",
+      command: "--rev abc123 --include src/app.ts",
     });
     assert.equal(
       b.w.document.querySelector(".review-toc a")?.textContent,
@@ -206,6 +203,202 @@ test("webview renders highlighted diffs, preserves names, selects ranges, saves 
     assert.equal(b.messages.at(-1).type, "deleteComment");
     b.state([], { patch: "" });
     assert.equal(b.w.document.querySelector(".review-comment"), null);
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("built-in diffs offer expandable context gaps in both layouts", () => {
+  const b = browser();
+  const expansionPatch = `diff --git a/a/example.ts b/a/example.ts
+--- a/a/example.ts
++++ b/a/example.ts
+@@ -10,3 +10,3 @@
+ const ten = 10;
+-const eleven = 11;
++const eleven = 12;
+ const twelve = 12;
+@@ -30,3 +30,3 @@
+ const thirty = 30;
+-const thirtyOne = 31;
++const thirtyOne = 32;
+ const thirtyTwo = 32;
+`;
+  const fullExpansionPatch = [
+    "diff --git a/a/example.ts b/a/example.ts",
+    "--- a/a/example.ts",
+    "+++ b/a/example.ts",
+    "@@ -1,40 +1,40 @@",
+    ...Array.from({ length: 40 }, (_, index) => {
+      const line = index + 1;
+      if (line === 11) return [`-const eleven = 11;`, `+const eleven = 12;`];
+      if (line === 31)
+        return [`-const thirtyOne = 31;`, `+const thirtyOne = 32;`];
+      return [` const line${line};`];
+    }).flat(),
+    "",
+  ].join("\n");
+  try {
+    b.state([], { patch: expansionPatch, contextLines: 3 });
+    const controls = () => [
+      ...b.w.document.querySelectorAll<HTMLButtonElement>(
+        ".review-context-expansion-button",
+      ),
+    ];
+    assert.deepEqual(
+      controls().map((button) => button.dataset.reviewContextDirection),
+      ["above", "between", "below"],
+    );
+    const inlineRows = [
+      ...b.w.document.querySelectorAll<HTMLTableRowElement>(
+        ".d2h-diff-table tr",
+      ),
+    ];
+    const belowRow = controls()
+      .find((button) => button.dataset.reviewContextDirection === "below")!
+      .closest("tr");
+    assert.equal(
+      belowRow,
+      inlineRows.at(-1),
+      "the below control follows the final rendered line",
+    );
+    const above = controls().find(
+      (button) => button.dataset.reviewContextDirection === "above",
+    )!;
+    const file = above.dataset.reviewContextFile;
+    above.click();
+    assert.deepEqual(b.messages.at(-1), {
+      type: "expandContext",
+      file,
+      direction: "above",
+      contextLines: 1000000,
+    });
+    b.state([], { patch: fullExpansionPatch, contextLines: 1000000 });
+    assert.equal(
+      controls().some(
+        (button) => button.dataset.reviewContextDirection === "above",
+      ),
+      false,
+      "the clicked block expands while other blocks stay collapsed",
+    );
+    const comment = {
+      id: "expanded-context-comment",
+      body: "Keep this line clear.",
+      status: "current",
+      anchor: {
+        file,
+        side: "new",
+        start: 11,
+        end: 11,
+        text: ["const eleven = 12;"],
+      },
+    };
+    b.state([comment], { patch: fullExpansionPatch, contextLines: 1000000 });
+    assert.equal(b.line(11).dataset.reviewLine, "11");
+    assert.ok(
+      b.w.document.querySelector(
+        '[data-comment-id="expanded-context-comment"]',
+      ),
+      "expanded context keeps existing comment anchors attached",
+    );
+    b.w.document
+      .querySelector<HTMLButtonElement>('[data-mode="split"]')!
+      .click();
+    const sideTables = b.w.document.querySelectorAll(
+      ".d2h-file-side-diff .d2h-diff-table",
+    );
+    assert.equal(sideTables.length, 2);
+    assert.deepEqual(
+      [...sideTables].map(
+        (table) =>
+          table.querySelectorAll(".review-context-expansion-button").length,
+      ),
+      [2, 2],
+      "split panes keep remaining controls aligned",
+    );
+    b.state([], {
+      command: "sl diff --rev custom --include a/example.ts",
+      patch: expansionPatch,
+      canExpandContext: true,
+    });
+    assert.ok(
+      b.w.document.querySelector(".review-context-expansion-button"),
+      "custom diff arguments support the same context expansion controls",
+    );
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("split context expansion aligns pure insertions and deletions", () => {
+  const b = browser();
+  const patch = [
+    "diff --git a/a/example.ts b/a/example.ts",
+    "--- a/a/example.ts",
+    "+++ b/a/example.ts",
+    "@@ -1,40 +1,40 @@",
+    ...Array.from({ length: 40 }, (_, index) => {
+      const line = index + 1;
+      if (line === 11) return "+const inserted = 11;";
+      if (line === 31) return "-const removed = 31;";
+      return ` const line${line};`;
+    }),
+    "",
+  ].join("\n");
+  try {
+    b.state([], { patch, contextLines: 1_000_000 });
+    b.w.document
+      .querySelector<HTMLButtonElement>('[data-mode="split"]')!
+      .click();
+    const panes = () => [
+      ...b.w.document.querySelectorAll<HTMLTableElement>(
+        ".d2h-file-side-diff .d2h-diff-table",
+      ),
+    ];
+    assert.equal(panes().length, 2);
+    const controls = (table: HTMLTableElement) => [
+      ...table.querySelectorAll<HTMLButtonElement>(
+        ".review-context-expansion-button",
+      ),
+    ];
+    assert.deepEqual(
+      panes().map((table) =>
+        controls(table).map((button) => button.dataset.reviewContextDirection),
+      ),
+      [
+        ["above", "between", "below"],
+        ["above", "between", "below"],
+      ],
+      "both panes expose the same logical context blocks",
+    );
+    const between = controls(panes()[0]).find(
+      (button) => button.dataset.reviewContextDirection === "between",
+    )!;
+    const id = between.dataset.reviewContextId;
+    const messageCount = b.messages.length;
+    between.click();
+    assert.equal(
+      b.messages.length,
+      messageCount,
+      "expanding a full patch stays local to the webview",
+    );
+    assert.deepEqual(
+      panes().map((table) =>
+        controls(table).map((button) => button.dataset.reviewContextDirection),
+      ),
+      [
+        ["above", "below"],
+        ["above", "below"],
+      ],
+      "only the clicked block expands in both panes",
+    );
+    assert.equal(
+      panes().some((table) =>
+        controls(table).some((button) => button.dataset.reviewContextId === id),
+      ),
+      false,
+      "the expanded block control is removed from both panes",
+    );
   } finally {
     b.dom.window.close();
   }

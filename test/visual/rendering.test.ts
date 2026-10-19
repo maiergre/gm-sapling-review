@@ -6,6 +6,8 @@ import { readFile, mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+const longContextValue = "x".repeat(320);
+
 const patch = `diff --git a/config.toml b/config.toml
 --- a/config.toml
 +++ b/config.toml
@@ -14,7 +16,7 @@ const patch = `diff --git a/config.toml b/config.toml
  name = "regex"
 -version = "1.12.4"
 +version = "1.13.1"
- checksum = "f1929b7759a4c1b9ec195452d139a074"
+ checksum = "${longContextValue}"
 +
 +[[package]]
 +name = "another-package"
@@ -130,6 +132,13 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
       );
       for (const layout of ["Inline", "Side by side"]) {
         await page.getByRole("button", { name: layout, exact: true }).click();
+        await page.evaluate(() => {
+          document
+            .querySelector<HTMLButtonElement>(
+              '[data-review-file="config.toml"][data-review-side="new"][data-review-line="1235"] .review-line-action',
+            )
+            ?.click();
+        });
         const metrics = await page.evaluate(() => {
           const d = document;
           const get = <T extends Element = HTMLElement>(s: string) =>
@@ -190,6 +199,12 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
           );
           const commentCard = d.querySelector<HTMLElement>(
             ".review-thread-row .review-comment",
+          );
+          const composer = d.querySelector<HTMLElement>(
+            ".review-thread-row .review-composer",
+          );
+          const composerScroller = composer?.closest<HTMLElement>(
+            ".d2h-file-side-diff,.d2h-file-diff",
           );
           const contextRows = [
             ...d.querySelectorAll<HTMLElement>(
@@ -268,6 +283,24 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
                   };
                 })()
               : undefined,
+            composerBounds:
+              composer && composerScroller
+                ? {
+                    composer: composer.getBoundingClientRect().toJSON(),
+                    scroller: composerScroller.getBoundingClientRect().toJSON(),
+                  }
+                : undefined,
+            contextButtonBounds: [
+              ...d.querySelectorAll<HTMLElement>(
+                ".review-context-expansion-button",
+              ),
+            ].map((button) => ({
+              button: button.getBoundingClientRect().toJSON(),
+              scroller: button
+                .closest<HTMLElement>(".d2h-file-side-diff,.d2h-file-diff")!
+                .getBoundingClientRect()
+                .toJSON(),
+            })),
             contextRows,
           };
         });
@@ -380,6 +413,28 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
         assert.equal(metrics.comment.borderStyle, "solid");
         assert.equal(metrics.comment.borderWidth, "1px");
         assert.notEqual(metrics.comment.radius, "0px");
+        assert.ok(metrics.composerBounds, "comment composer is rendered");
+        assert.ok(
+          metrics.composerBounds.composer.left >=
+            metrics.composerBounds.scroller.left - 1,
+          `${layout} composer starts within its visible pane`,
+        );
+        assert.ok(
+          metrics.composerBounds.composer.right <=
+            metrics.composerBounds.scroller.right + 1,
+          `${layout} composer ends within its visible pane`,
+        );
+        assert.ok(
+          metrics.contextButtonBounds.length > 0,
+          `${layout} has context expansion controls`,
+        );
+        for (const bounds of metrics.contextButtonBounds) {
+          assert.ok(
+            bounds.button.left >= bounds.scroller.left - 1 &&
+              bounds.button.right <= bounds.scroller.right + 1,
+            `${layout} context expansion control stays within its visible pane: ${JSON.stringify(bounds)}`,
+          );
+        }
         for (const color of metrics.backgrounds) {
           const brightness = color.reduce((a, b) => a + b, 0) / 3;
           assert.ok(

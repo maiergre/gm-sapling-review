@@ -139,8 +139,10 @@ type Host = {
   openedDocuments: Array<{ uri: FakeUri; lineCount: number }>;
   shownEditors: Array<{
     document: { uri: FakeUri; lineCount: number };
+    options?: { preview?: boolean; viewColumn?: number };
     selection?: FakeSelection;
     reveal?: FakeRange;
+    revealType?: number;
   }>;
   workspaceState: Map<string, unknown>;
   inputValues: string[];
@@ -240,13 +242,19 @@ function makeHost(repo: string, storage: string): Host {
       inputValues.shift() ?? 'sl diff --rev ".^" --include src/app.ts',
     showErrorMessage: async () => undefined,
     showSaveDialog: async () => undefined,
-    showTextDocument: async (document: { uri: FakeUri; lineCount: number }) => {
+    showTextDocument: async (
+      document: { uri: FakeUri; lineCount: number },
+      options?: { preview?: boolean; viewColumn?: number },
+    ) => {
       const editor = {
         document,
+        options,
         selection: undefined as FakeSelection | undefined,
         reveal: undefined as FakeRange | undefined,
-        revealRange(range: FakeRange) {
+        revealType: undefined as number | undefined,
+        revealRange(range: FakeRange, revealType?: number) {
           editor.reveal = range;
+          editor.revealType = revealType;
         },
       };
       shownEditors.push(editor);
@@ -264,6 +272,7 @@ function makeHost(repo: string, storage: string): Host {
     Selection: FakeSelection,
     Range: FakeRange,
     ViewColumn: { Active: 1, Beside: 2 },
+    TextEditorRevealType: { InCenterIfOutsideViewport: 1 },
     ProgressLocation: { Notification: 15 },
     workspace,
     window,
@@ -351,7 +360,7 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
 }
 
-test("activation persists custom review comments, preserves custom-command side effects, and opens file lines", async (t) => {
+test("activation persists custom review comments, runs custom diff arguments explicitly, and opens file lines", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "gm-sapling-extension-"));
   const repo = path.join(root, "repo");
   const storage = path.join(root, "storage");
@@ -388,29 +397,79 @@ test("activation persists custom review comments, preserves custom-command side 
     await host.commands.get("gmSapling.review")?.();
     assert.deepEqual(
       host.execCalls.filter((call) => call.args.includes("diff")).at(-1)?.args,
-      ["--color", "never", "diff", "--git", "--rev", "."],
+      [
+        "--color",
+        "never",
+        "diff",
+        "--git",
+        "--rev",
+        ".",
+        "--unified",
+        "1000000",
+      ],
     );
     assert.equal(
       host.quickPickCalls.length,
-      0,
-      "Open Diff must not ask which comparison to use",
+      1,
+      "Open Diff asks which repository to review when several are found",
+    );
+    await waitFor(() => host.panels.length === 1);
+    const panel = host.panels[0];
+    const initialState = panel.webview.messages
+      .filter((message: any) => message.type === "state")
+      .at(-1) as any;
+    const reviewUpdatedAtBeforeExpansion =
+      initialState?.reviews?.[0]?.updatedAt;
+    const diffCalls = () =>
+      host.execCalls.filter((call) => call.args.includes("diff"));
+    const diffCallsBeforeExpansion = diffCalls().length;
+    panel.webview.emit({
+      type: "expandContext",
+      file: "src/app.ts",
+      direction: "above",
+      contextLines: 1000000,
+    });
+    await waitFor(() => diffCalls().length > diffCallsBeforeExpansion);
+    assert.deepEqual(diffCalls().at(-1), {
+      file: "sl",
+      args: [
+        "--color",
+        "never",
+        "diff",
+        "--git",
+        "--rev",
+        ".",
+        "--unified",
+        "1000000",
+      ],
+      cwd: repo,
+    });
+    const expandedState = panel.webview.messages
+      .filter((message: any) => message.type === "state")
+      .at(-1) as any;
+    assert.equal(expandedState.contextLines, 1000000);
+    assert.equal(
+      expandedState.reviews[0].updatedAt,
+      reviewUpdatedAtBeforeExpansion,
+      "context expansion does not update review metadata",
     );
     const custom = host.commands.get("gmSapling.custom");
     assert.ok(custom, "custom review command should be registered");
     await custom?.();
     await waitFor(() => host.panels.length === 1);
 
-    const diffCalls = () =>
-      host.execCalls.filter((call) => call.args.includes("diff"));
     t.diagnostic(`exec calls: ${JSON.stringify(host.execCalls)}`);
     assert.deepEqual(diffCalls().at(-1)?.args, [
       "--color",
       "never",
       "diff",
+      "--git",
       "--rev",
       ".^",
       "--include",
       "src/app.ts",
+      "--unified",
+      "1000000",
     ]);
     assert.equal(
       host.workspaceState.get("lastReview") != null,
@@ -419,7 +478,6 @@ test("activation persists custom review comments, preserves custom-command side 
     );
     assert.equal(host.panels.length, 1);
 
-    const panel = host.panels[0];
     const diffCallsBeforeToolbarRefresh = diffCalls().length;
     panel.webview.emit({
       type: "refresh",
@@ -429,14 +487,23 @@ test("activation persists custom review comments, preserves custom-command side 
     await waitFor(() => diffCalls().length > diffCallsBeforeToolbarRefresh);
     assert.deepEqual(diffCalls().at(-1), {
       file: "sl",
-      args: ["--color", "never", "diff", "--git", "--rev", ".^"],
+      args: [
+        "--color",
+        "never",
+        "diff",
+        "--git",
+        "--rev",
+        ".^",
+        "--unified",
+        "1000000",
+      ],
       cwd: repo,
     });
     const diffCallsBeforeCustomRefresh = diffCalls().length;
     panel.webview.emit({
       type: "refresh",
       choice: "custom",
-      command: 'sl diff --rev ".^" --include src/app.ts',
+      command: "--rev .^ --include src/app.ts",
     });
     await waitFor(() => diffCalls().length > diffCallsBeforeCustomRefresh);
     assert.deepEqual(diffCalls().at(-1), {
@@ -445,10 +512,13 @@ test("activation persists custom review comments, preserves custom-command side 
         "--color",
         "never",
         "diff",
+        "--git",
         "--rev",
         ".^",
         "--include",
         "src/app.ts",
+        "--unified",
+        "1000000",
       ],
       cwd: repo,
     });
@@ -619,17 +689,27 @@ test("activation persists custom review comments, preserves custom-command side 
     await waitFor(() => state().repo === otherRepo && !!state().patch);
     assert.equal(state().comments.length, 0, "reviews isolated by repo");
     assert.equal(diffCalls().at(-1)?.cwd, otherRepo);
+    const statesBeforeReturningRepo = panel.webview.messages.filter(
+      (message: any) => message.type === "state",
+    ).length;
     panel.webview.emit({ type: "selectRepo", repo });
-    await waitFor(() => state().repo === repo && state().comments.length === 3);
+    await waitFor(
+      () =>
+        state().repo === repo &&
+        state().comments.length === 3 &&
+        panel.webview.messages.filter(
+          (message: any) => message.type === "state",
+        ).length > statesBeforeReturningRepo,
+    );
     panel.webview.emit({ type: "viewMode", mode: "split" });
     await waitFor(() => host.workspaceState.get("global:viewMode") === "split");
     panel.webview.emit({
       type: "refresh",
       choice: "custom",
-      command: 'sl diff --rev ".^" --include src/app.ts',
+      command: "--rev .^ --include src/app.ts",
     });
     await waitFor(
-      () => state().command === 'sl diff --rev ".^" --include src/app.ts',
+      () => state().command === "sl diff --git --rev '.^' --include src/app.ts",
     );
 
     const callsBeforeSave = diffCalls().length;
@@ -660,6 +740,8 @@ test("activation persists custom review comments, preserves custom-command side 
       await realpath(file),
     );
     assert.equal(host.shownEditors.at(-1)?.selection?.anchor.line, 1);
+    assert.deepEqual(host.shownEditors.at(-1)?.options, { preview: true });
+    assert.equal(host.shownEditors.at(-1)?.revealType, 1);
 
     panel.dispose();
     const serializer = host.serializers.get("gmSapling.review");
@@ -767,8 +849,18 @@ test("activation persists custom review comments, preserves custom-command side 
         latest().comments.length === 0 &&
         latest().reviews.length === 1,
     );
+    const statesBeforeRepoSwitch = upgradedPanel.webview.messages.filter(
+      (message: any) => message.type === "state",
+    ).length;
     upgradedPanel.webview.emit({ type: "selectRepo", repo: otherRepo });
-    await waitFor(() => latest().repo === otherRepo);
+    await waitFor(
+      () =>
+        latest().repo === otherRepo &&
+        upgradedPanel.webview.messages.filter(
+          (message: any) => message.type === "state",
+        ).length >=
+          statesBeforeRepoSwitch + 2,
+    );
     assert.ok(
       latest().reviews.length > 0,
       "bulk deletion leaves other repository reviews intact",

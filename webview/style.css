@@ -478,11 +478,13 @@ a {
 }
 .d2h-file-diff {
   overflow-x: auto;
+  container-type: inline-size;
 }
 .d2h-file-side-diff {
   overflow-x: auto;
   min-width: 0;
   width: 50%;
+  container-type: inline-size;
 }
 
 .d2h-file-side-diff:first-child {
@@ -563,6 +565,36 @@ a {
   line-height: inherit;
   color: var(--review-fg);
 }
+
+.review-context-expansion-row > td {
+  padding: 0.15rem 0.4rem;
+  border-top: 1px solid var(--review-border);
+  border-bottom: 1px solid var(--review-border);
+  background: var(--review-surface-raised);
+  text-align: center;
+}
+
+.review-context-expansion-cell {
+  text-align: left !important;
+}
+
+.review-context-expansion-button {
+  display: block;
+  position: sticky;
+  left: 0;
+  width: calc(100cqw - 0.8rem);
+  max-width: calc(100cqw - 0.8rem);
+  margin: 0;
+  border-color: transparent;
+  background: transparent;
+  color: var(--review-link);
+  text-align: center;
+}
+
+.review-context-expansion-button:hover {
+  background: var(--review-selected);
+}
+
 .d2h-code-line-prefix {
   color: var(--review-muted);
 }
@@ -609,6 +641,7 @@ a {
 }
 
 .review-thread-row > td {
+  min-width: 0;
   padding: 0.4rem 0.65rem 0.65rem;
   border-top: 1px solid var(--review-focus);
   background: var(--review-surface-raised);
@@ -616,6 +649,11 @@ a {
 
 .review-thread-row .review-comment,
 .review-thread-row .review-composer {
+  position: sticky;
+  left: 0.65rem;
+  width: calc(100cqw - 1.3rem);
+  min-width: 0;
+  max-width: calc(100cqw - 1.3rem);
   margin: 0;
   border: 1px solid var(--review-border);
   border-radius: 5px;
@@ -735,6 +773,8 @@ a {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
+  min-width: 0;
+  overflow-wrap: anywhere;
   gap: 0.55rem;
   margin-bottom: 0.5rem;
   color: var(--review-muted);
@@ -742,6 +782,8 @@ a {
 }
 
 .review-comment-location {
+  min-width: 0;
+  max-width: 100%;
   padding: 0;
   border: 0;
   background: transparent;
@@ -755,6 +797,8 @@ a {
   );
   font-size: inherit;
   text-align: left;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .review-comment-location:hover {
@@ -763,6 +807,8 @@ a {
 
 .review-comment-quote {
   max-height: 8rem;
+  min-width: 0;
+  max-width: 100%;
   margin: 0 0 0.55rem;
   padding: 0.45rem 0.6rem;
   overflow: auto;
@@ -776,6 +822,8 @@ a {
 .review-comment textarea {
   display: block;
   width: 100%;
+  min-width: 0;
+  max-width: 100%;
   resize: vertical;
   padding: 0.5rem;
   border: 1px solid var(--review-input-border);
@@ -791,6 +839,7 @@ a {
 
 .review-comment-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.45rem;
   justify-content: flex-end;
   margin-top: 0.55rem;

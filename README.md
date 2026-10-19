@@ -1,6 +1,6 @@
 # Sapling Review
 
-A separate VS Code extension for reviewing Sapling diffs, with syntax highlighting and durable local comments. Source and build files live in this directory. 
+A separate VS Code extension for reviewing Sapling diffs, with syntax highlighting and durable local comments. Source and build files live in this directory.
 
 ## Install the latest release
 
@@ -29,21 +29,21 @@ For development, run `npm run build`, open this directory in VS Code, and press 
 
 ## Reviewing
 
-**GM Sapling Review: Open Diff** opens uncommitted changes without asking which comparison to use. Use the **Repository** dropdown to switch repositories, and choose uncommitted, head, stack, or a custom command in the toolbar. All workspace folders are searched, including repositories nested under non-repository folders. Workspace folders inside an existing repository are supported too. Repository metadata, dependency directories, and symbolic links are excluded from recursive scanning.
+**GM Sapling Review: Open Diff** opens uncommitted changes. If more than one repository is found, choose one before the first diff runs. Use the **Repository** dropdown to switch repositories, and choose uncommitted, head, stack, or a custom command in the toolbar. All workspace folders are searched, including repositories nested under non-repository folders. Workspace folders inside an existing repository are supported too. Repository metadata, dependency directories, and symbolic links are excluded from recursive scanning.
 
-Custom commands run the configured Sapling executable directly, with quoted arguments supported, in the selected repository. For example:
+The custom field contains only arguments passed to `sl diff`; the extension always adds `sl diff --git` and fetches full context for local expansion. Quoted arguments are supported. For example:
 
 ```sh
-sl diff --git --rev 'ancestor(.,interestingmaster())'
-sl diff --git --rev abc123 --rev def456
-sl show --git abc123
+--rev 'ancestor(.,interestingmaster())'
+--rev abc123 --rev def456
+--rev abc123 --include src/app.ts
 ```
 
-Commands must output unified/Git-format patches. Shell pipelines, redirects, and command substitutions are unsupported. Custom commands can have side effects; they run when chosen or explicitly refreshed, not automatically when a file is saved or the window is restored. Color is disabled for patch parsing.
+`--git`, `--unified`, and `-U` are managed internally. Shell pipelines, redirects, and command substitutions are unsupported. Custom arguments run only when explicitly refreshed, not automatically when a file is saved or the window is restored. Color is disabled for patch parsing.
 
 Selecting a preset immediately refreshes the diff in the selected repository. Selecting **Custom command** leaves the current diff unchanged until you run the command. Clicking or focusing the command field switches to **Custom command**; edit the command and click **Refresh** (or press Enter) to run it. Use the **Repository** dropdown to select another repository. Running **GM Sapling Review: Open Diff** again also rescans workspace folders for newly created repositories.
 
-Use the toolbar to switch between inline and side-by-side views. Your last layout is remembered across panel closes and restarts. The collapsible file tree at the top groups files by directory and links to each file. File headers fold/unfold their contents. Click a line number to open the working-copy file in an editor; historical/deleted-side numbers refer to the original diff and may not match the working copy. Deleted files cannot be opened in the working copy.
+Use the toolbar to switch between inline and side-by-side views. Your last layout is remembered across panel closes and restarts. The collapsible file tree at the top groups files by directory and links to each file. File headers fold/unfold their contents. Diff comparisons show controls above, below, and between hunks; each control expands only its own unchanged block. Click a line number to open the working-copy file in an editor; historical/deleted-side numbers refer to the original diff and may not match the working copy. Deleted files cannot be opened in the working copy.
 
 Use a line's **+** button to start a comment; Shift-click another line's **+** button on the same side of the same file to select a range. Save, edit, or delete comments in the review view. **Save all comments** saves all nonempty new/edit drafts in the selected review in one atomic operation; other reviews’ drafts remain separate. **Export review** writes one Markdown file containing review name, repository, command, filenames, old/new sides, line ranges, quoted source, comment text, and outdated status. The suggested filename is `00-review-{reviewname}-yyyy-mm-dd.md`, using the local date. Export again after further edits to update that file. The comment index at the bottom lists all saved comments; click one to jump to it, or delete it directly from the list.
 
@@ -57,11 +57,9 @@ Existing command-keyed reviews are imported automatically. Uncommitted reviews b
 
 The extension version stays at **0.1.2** during these iterations. Reinstall the rebuilt VSIX with `--force`, then run **Developer: Reload Window**.
 
-
 Refreshing compares each comment's original source text against the same side and line range of the new patch. Changed, moved, or missing ranges are marked **outdated**, including comments on files no longer present. This deliberately conservative check does not silently relocate comments. Preset diffs refresh on editor saves; use **Refresh** for external changes and custom commands.
 
-
-This is a review-focused companion, with its own command IDs. Keep the official Sapling SCM extension installed for smartlog, SCM status, commit/amend, blame, worktrees, remote review integrations, and upstream context expansion. Those features are not copied into this extension. The three preset revsets match [upstream comparison definitions](https://github.com/facebook/sapling/blob/79071c2a3ea20c36ed71332608535e5801101bba/addons/shared/Comparison.ts). The [upstream extension](https://github.com/facebook/sapling/tree/79071c2a3ea20c36ed71332608535e5801101bba/addons/vscode) already supports syntax highlighting and split/inline views; this implementation uses diff2html with highlight.js and adds the local review workflow and recursive repository discovery.
+This is a review-focused companion, with its own command IDs. Keep the official Sapling SCM extension installed for smartlog, SCM status, commit/amend, blame, worktrees, and remote review integrations. Those features are not copied into this extension. The three preset revsets match [upstream comparison definitions](https://github.com/facebook/sapling/blob/79071c2a3ea20c36ed71332608535e5801101bba/addons/shared/Comparison.ts). The [upstream extension](https://github.com/facebook/sapling/tree/79071c2a3ea20c36ed71332608535e5801101bba/addons/vscode) already supports syntax highlighting, split/inline views, and context expansion; this implementation uses diff2html with highlight.js and adds the local review workflow and recursive repository discovery.
 
 ## Validation
 

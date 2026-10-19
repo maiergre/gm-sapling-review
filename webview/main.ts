@@ -4,6 +4,9 @@ import "./style.css";
 
 type DiffSide = "old" | "new";
 type ViewMode = "split" | "inline";
+type ContextExpansionDirection = "above" | "below" | "between";
+
+const DEFAULT_CONTEXT_LINES = 3;
 
 export interface ReviewAnchor {
   file: string;
@@ -31,6 +34,11 @@ interface ReviewStateMessage {
   repos?: string[];
   reviews?: ReviewSummary[];
   viewMode?: ViewMode;
+  /** The unified context requested for the current patch, when known. */
+  contextLines?: number;
+  canExpandContext?: boolean;
+  /** Arguments shown in the custom diff field, without internal flags. */
+  customCommand?: string;
   patch?: string;
   comments?: ReviewComment[];
 }
@@ -145,11 +153,18 @@ let legacyDraftsForeign = false;
 let reviewManager: HTMLElement | undefined;
 let reviewManagerSearch = "";
 let reviewManagerFocus: HTMLElement | null = null;
+let pendingContextExpansion: { id: string } | undefined;
+const expandedContextBlocks = new Set<string>();
 
 const PRESET_COMMANDS: Record<string, string> = {
   uncommitted: "sl diff --git --rev .",
   head: "sl diff --git --rev .^",
   stack: "sl diff --git --rev ancestor(.,interestingmaster())",
+};
+const PRESET_ARGUMENTS: Record<string, string> = {
+  uncommitted: "--rev .",
+  head: "--rev .^",
+  stack: "--rev ancestor(.,interestingmaster())",
 };
 
 for (const item of restored.pending ?? []) {
@@ -677,7 +692,7 @@ function buildToolbar(): void {
   actionRow.append(preset);
   preset.addEventListener("change", () => {
     if (preset.value !== "custom") {
-      customCommandInput!.value = PRESET_COMMANDS[preset.value] ?? "";
+      customCommandInput!.value = PRESET_ARGUMENTS[preset.value] ?? "";
       toolbar
         .querySelector<HTMLButtonElement>(".review-refresh-button")
         ?.click();
@@ -688,13 +703,10 @@ function buildToolbar(): void {
   customCommandInput = document.createElement("input");
   customCommandInput.type = "text";
   customCommandInput.className = "review-command-input";
-  customCommandInput.placeholder = "sl diff --git …";
-  customCommandInput.setAttribute(
-    "aria-label",
-    "Sapling command producing a diff",
-  );
+  customCommandInput.placeholder = "--rev . --include src/app.ts";
+  customCommandInput.setAttribute("aria-label", "Arguments passed to sl diff");
   customCommandInput.spellcheck = false;
-  customCommandInput.value = review.command ?? PRESET_COMMANDS.uncommitted;
+  customCommandInput.value = review.customCommand ?? "";
   const selectCustomCommand = () => {
     if (preset.value !== "custom") {
       preset.value = "custom";
@@ -774,6 +786,7 @@ function updatePresetFromCommand(): void {
     ([, command]) => command === review.command,
   )?.[0];
   preset.value = matchingPreset ?? "custom";
+  if (customCommandInput) customCommandInput.value = review.customCommand ?? "";
   updateCommandControls();
 }
 
@@ -820,6 +833,370 @@ function sideFileName(
 
 function fileKey(name: string, index: number): string {
   return `${index}:${name}`;
+}
+
+interface HunkRange {
+  oldStart: number;
+  oldCount: number;
+  newStart: number;
+  newCount: number;
+}
+
+interface ContextRun {
+  rows: HTMLTableRowElement[];
+  previousChange?: HTMLTableRowElement[];
+  nextChange?: HTMLTableRowElement[];
+}
+
+interface AlignedContextRun {
+  rowsByTable: Array<Array<HTMLTableRowElement | undefined>>;
+  previousChange: boolean;
+  nextChange: boolean;
+}
+
+function contextBlockKey(
+  file: string,
+  direction: ContextExpansionDirection,
+  ordinal: number,
+): string {
+  return `${file}:${direction}:${ordinal}`;
+}
+
+function contextExpansionAvailable(): boolean {
+  return (
+    review.canExpandContext ??
+    (review.command === PRESET_COMMANDS.uncommitted ||
+      review.command === PRESET_COMMANDS.head ||
+      review.command === PRESET_COMMANDS.stack)
+  );
+}
+
+function parseHunkRange(row: HTMLTableRowElement): HunkRange | undefined {
+  const text = row.textContent?.replace(/\s+/g, " ").trim() ?? "";
+  const match = text.match(
+    /^@@+\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/,
+  );
+  if (!match) return undefined;
+  return {
+    oldStart: Number(match[1]),
+    oldCount: Number(match[2] ?? 1),
+    newStart: Number(match[3]),
+    newCount: Number(match[4] ?? 1),
+  };
+}
+
+function hunkRows(table: HTMLTableElement): HTMLTableRowElement[] {
+  return [...table.querySelectorAll<HTMLTableRowElement>("tr")].filter(
+    (row) => row.querySelector("td.d2h-info") && !lineRows(table).includes(row),
+  );
+}
+
+function lineRows(table: HTMLTableElement): HTMLTableRowElement[] {
+  return [...table.querySelectorAll<HTMLTableRowElement>("tbody > tr")].filter(
+    (row) =>
+      !!row.querySelector(".d2h-code-linenumber, .d2h-code-side-linenumber") &&
+      !!row.querySelector(".d2h-code-line, .d2h-code-side-line") &&
+      !row.querySelector(".d2h-info") &&
+      !row.classList.contains("review-context-expansion-row"),
+  );
+}
+
+function isChangedRow(row: HTMLTableRowElement): boolean {
+  return !!row.querySelector(".d2h-change, .d2h-del, .d2h-ins");
+}
+
+function contextRuns(table: HTMLTableElement): ContextRun[] {
+  const rows = lineRows(table);
+  const runs: ContextRun[] = [];
+  let current: ContextRun | undefined;
+  let previousChange: HTMLTableRowElement[] | undefined;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    if (isChangedRow(row)) {
+      if (current) {
+        const changeRows = [row];
+        while (index + 1 < rows.length && isChangedRow(rows[index + 1]))
+          changeRows.push(rows[++index]);
+        current.nextChange = changeRows;
+        runs.push(current);
+        current = undefined;
+        previousChange = changeRows;
+        continue;
+      }
+      const changeRows = [row];
+      while (index + 1 < rows.length && isChangedRow(rows[index + 1]))
+        changeRows.push(rows[++index]);
+      previousChange = changeRows;
+      continue;
+    }
+    if (!current) current = { rows: [], previousChange };
+    current.rows.push(row);
+  }
+  if (current) runs.push(current);
+  return runs;
+}
+
+function alignedContextRuns(tables: HTMLTableElement[]): AlignedContextRun[] {
+  const rowsByTable = tables.map(lineRows);
+  const runs: AlignedContextRun[] = [];
+  const rowCount = Math.max(...rowsByTable.map((rows) => rows.length), 0);
+  let current: AlignedContextRun | undefined;
+  let previousChange = false;
+  for (let index = 0; index < rowCount; index += 1) {
+    const changed = rowsByTable.some((rows) => {
+      const row = rows[index];
+      return row !== undefined && isChangedRow(row);
+    });
+    if (changed) {
+      if (current) {
+        current.nextChange = true;
+        runs.push(current);
+        current = undefined;
+      }
+      previousChange = true;
+      continue;
+    }
+    if (!current) {
+      current = {
+        rowsByTable: rowsByTable.map(() => []),
+        previousChange,
+        nextChange: false,
+      };
+    }
+    rowsByTable.forEach((rows, tableIndex) => {
+      current!.rowsByTable[tableIndex].push(rows[index]);
+    });
+  }
+  if (current) runs.push(current);
+  return runs;
+}
+
+function addContextExpansionRow(
+  reference: HTMLTableRowElement,
+  position: "before" | "after",
+  file: string,
+  direction: ContextExpansionDirection,
+  id: string,
+  needsHost = false,
+): void {
+  const row = document.createElement("tr");
+  row.className = "review-context-expansion-row";
+  const cell = document.createElement("td");
+  cell.className = "review-context-expansion-cell";
+  cell.colSpan = 2;
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "review-context-expansion-button";
+  button.dataset.reviewContextDirection = direction;
+  button.dataset.reviewContextFile = file;
+  button.dataset.reviewContextId = id;
+  if (needsHost) button.dataset.reviewContextNeedsHost = "true";
+  const label =
+    direction === "above"
+      ? "Show more unchanged lines above"
+      : direction === "below"
+        ? "Show more unchanged lines below"
+        : "Show more unchanged lines between hunks";
+  button.textContent = label;
+  button.setAttribute("aria-label", label);
+  button.title = label;
+  button.addEventListener("click", () =>
+    requestContextExpansion(
+      file,
+      direction,
+      id,
+      button.dataset.reviewContextNeedsHost === "true",
+    ),
+  );
+  cell.append(button);
+  row.append(cell);
+  if (position === "before") reference.before(row);
+  else reference.after(row);
+}
+
+function requestContextExpansion(
+  file: string,
+  direction: ContextExpansionDirection,
+  id: string,
+  needsHost = false,
+): void {
+  if (!contextExpansionAvailable()) return;
+  if (needsHost) {
+    pendingContextExpansion = { id };
+    showInfo("Loading more unchanged lines…");
+    send({
+      type: "expandContext",
+      file,
+      direction,
+      contextLines: 1_000_000,
+    });
+    return;
+  }
+  expandedContextBlocks.add(id);
+  renderDiff();
+}
+
+function decorateContextExpansion(
+  wrapper: HTMLElement,
+  file: string,
+  tables: HTMLTableElement[],
+  parsedFile: ReturnType<typeof parse>[number] | undefined,
+): void {
+  if (!contextExpansionAvailable() || !tables.length) return;
+  const controls = new Set<string>();
+  const add = (
+    reference: HTMLTableRowElement,
+    position: "before" | "after",
+    direction: ContextExpansionDirection,
+    id: string,
+    table?: HTMLTableElement,
+    needsHost = false,
+  ) => {
+    const controlKey = `${table ? tables.indexOf(table) : 0}:${id}`;
+    if (controls.has(controlKey) || expandedContextBlocks.has(id)) return;
+    controls.add(controlKey);
+    addContextExpansionRow(reference, position, file, direction, id, needsHost);
+  };
+
+  const hasCommentInRows = (rows: HTMLTableRowElement[]): boolean => {
+    const lineNumbers = rows.flatMap((row) => {
+      const numberCell = row.querySelector<HTMLElement>(
+        ".d2h-code-linenumber, .d2h-code-side-linenumber",
+      );
+      return [
+        parseLine(numberCell?.querySelector(".line-num1")?.textContent),
+        parseLine(numberCell?.querySelector(".line-num2")?.textContent),
+        parseLine(numberCell?.textContent),
+      ].filter((value): value is number => value !== undefined);
+    });
+    if (!lineNumbers.length) return false;
+    const min = Math.min(...lineNumbers);
+    const max = Math.max(...lineNumbers);
+    return (review.comments ?? []).some(
+      (comment) =>
+        comment.status !== "outdated" &&
+        comment.anchor.file === file &&
+        comment.anchor.start <= max &&
+        comment.anchor.end >= min,
+    );
+  };
+
+  const collapseRun = (
+    runIndex: number,
+    rowsByTable: Array<Array<HTMLTableRowElement | undefined>>,
+    previousChange: boolean,
+    nextChange: boolean,
+  ) => {
+    const allRows = rowsByTable.flatMap((rows) =>
+      rows.filter((row): row is HTMLTableRowElement => row !== undefined),
+    );
+    if (!allRows.length) return;
+    const runLength = Math.max(...rowsByTable.map((rows) => rows.length), 0);
+    const direction: ContextExpansionDirection = previousChange
+      ? nextChange
+        ? "between"
+        : "below"
+      : "above";
+    const id = contextBlockKey(file, direction, runIndex);
+    const keepBefore = previousChange ? DEFAULT_CONTEXT_LINES : 0;
+    const keepAfter = nextChange ? DEFAULT_CONTEXT_LINES : 0;
+    const hiddenStart = keepBefore;
+    const hiddenEnd = runLength - keepAfter;
+    if (
+      hiddenStart >= hiddenEnd ||
+      expandedContextBlocks.has(id) ||
+      hasCommentInRows(allRows)
+    )
+      return;
+    for (const rows of rowsByTable) {
+      for (const row of rows.slice(hiddenStart, hiddenEnd))
+        if (row) row.hidden = true;
+    }
+    rowsByTable.forEach((rows, tableIndex) => {
+      const table = tables[tableIndex];
+      const reference =
+        rows[hiddenStart] ??
+        [...rows]
+          .reverse()
+          .find((row): row is HTMLTableRowElement => row !== undefined);
+      if (reference) add(reference, "before", direction, id, table);
+    });
+  };
+
+  if (tables.length > 1) {
+    for (const [runIndex, run] of alignedContextRuns(tables).entries()) {
+      collapseRun(
+        runIndex,
+        run.rowsByTable,
+        run.previousChange,
+        run.nextChange,
+      );
+    }
+  } else {
+    for (const [runIndex, run] of contextRuns(tables[0]).entries()) {
+      if (!run.rows.length) continue;
+      collapseRun(runIndex, [run.rows], !!run.previousChange, !!run.nextChange);
+    }
+  }
+
+  const primaryHunks = hunkRows(tables[0]);
+  const ranges = primaryHunks.map(parseHunkRange);
+  if (ranges.some((range) => !range) || !ranges.length) return;
+  const changes = parsedFile?.blocks.map((block) => {
+    const changed = block.lines.filter((line) => line.type !== "context");
+    const values = changed.flatMap((line) =>
+      [line.newNumber, line.oldNumber].filter(
+        (value): value is number => value !== undefined,
+      ),
+    );
+    if (!values.length) return undefined;
+    return `${Math.min(...values)}-${Math.max(...values)}`;
+  });
+  const firstChange = changes?.find((change) => change !== undefined);
+  const changeGroupCount =
+    parsedFile?.blocks.reduce((count, block) => {
+      let changed = false;
+      for (const line of block.lines) {
+        if (line.type === "context") changed = false;
+        else if (!changed) {
+          count += 1;
+          changed = true;
+        }
+      }
+      return count;
+    }, 0) ?? 0;
+  const addBeforeHunk = (
+    index: number,
+    direction: ContextExpansionDirection,
+    id: string,
+  ) => {
+    for (const table of tables) {
+      const rows = hunkRows(table);
+      if (rows[index]) add(rows[index], "before", direction, id, table, true);
+    }
+  };
+  const first = ranges[0]!;
+  if ((first.oldStart > 1 || first.newStart > 1) && firstChange) {
+    addBeforeHunk(0, "above", contextBlockKey(file, "above", 0));
+  }
+  for (let index = 1; index < ranges.length; index += 1) {
+    const previous = ranges[index - 1]!;
+    const current = ranges[index]!;
+    const oldGap = current.oldStart - (previous.oldStart + previous.oldCount);
+    const newGap = current.newStart - (previous.newStart + previous.newCount);
+    if (oldGap <= 0 && newGap <= 0) continue;
+    if (!changes?.[index - 1] || !changes[index]) continue;
+    const id = contextBlockKey(file, "between", index);
+    addBeforeHunk(index, "between", id);
+  }
+  if (changeGroupCount) {
+    const id = contextBlockKey(file, "below", changeGroupCount);
+    for (const table of tables) {
+      const rows = lineRows(table);
+      const target = rows.at(-1) ?? hunkRows(table).at(-1);
+      if (target) add(target, "after", "below", id, table, true);
+    }
+  }
 }
 
 function reviewScope(
@@ -1022,6 +1399,12 @@ function renderDiff(): void {
       wrapper,
       sideFileName(files[index], "old"),
       sideFileName(files[index], "new"),
+    );
+    decorateContextExpansion(
+      wrapper,
+      name,
+      [...wrapper.querySelectorAll<HTMLTableElement>(".d2h-diff-table")],
+      files[index],
     );
 
     const parts = name.split("/").filter(Boolean);
@@ -1897,6 +2280,8 @@ function acknowledge(nextComments: ReviewComment[]): void {
 }
 
 function onState(message: ReviewStateMessage): void {
+  const previousPatch = review.patch ?? "";
+  const completedExpansion = pendingContextExpansion;
   const previousScope = currentReviewScope();
   const nextScope = reviewScope(
     message.repo,
@@ -1929,6 +2314,13 @@ function onState(message: ReviewStateMessage): void {
     selection = undefined;
     activeComposerKey = undefined;
     editingComment = undefined;
+    expandedContextBlocks.clear();
+    pendingContextExpansion = undefined;
+  } else if (completedExpansion) {
+    expandedContextBlocks.add(completedExpansion.id);
+    pendingContextExpansion = undefined;
+  } else if ((message.patch ?? "") !== previousPatch) {
+    expandedContextBlocks.clear();
   }
   review = {
     type: "state",
@@ -1939,6 +2331,9 @@ function onState(message: ReviewStateMessage): void {
     repos: message.repos,
     reviews: message.reviews,
     viewMode: message.viewMode,
+    contextLines: message.contextLines,
+    canExpandContext: message.canExpandContext,
+    customCommand: message.customCommand,
     patch: message.patch ?? "",
     comments: Array.isArray(message.comments) ? message.comments : [],
   };
@@ -1949,7 +2344,7 @@ function onState(message: ReviewStateMessage): void {
   }
   acknowledge(review.comments ?? []);
   if (customCommandInput && document.activeElement !== customCommandInput)
-    customCommandInput.value = review.command ?? "";
+    customCommandInput.value = review.customCommand ?? "";
   updatePresetFromCommand();
   const location = review.repo
     ? `Repository: ${review.repo}`
@@ -2010,7 +2405,7 @@ window.addEventListener("message", (event) => {
       message.message ||
         "Sapling Review reported an error. Drafts were kept locally.",
     );
-    renderComments();
+    renderDiff();
   }
 });
 

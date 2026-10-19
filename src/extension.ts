@@ -15,11 +15,14 @@ import {
   markdown,
 } from "./core";
 
+const FULL_CONTEXT_LINES = 1_000_000;
+
 export function activate(context: vscode.ExtensionContext) {
   const store = new ReviewStore(context.globalStorageUri.fsPath);
   let panel: vscode.WebviewPanel | undefined;
   let review: Review | undefined;
   let patch = "";
+  let contextLines = FULL_CONTEXT_LINES;
   let repositories: string[] = [];
   let viewMode = context.globalState.get<"inline" | "split">(
     "viewMode",
@@ -64,8 +67,11 @@ export function activate(context: vscode.ExtensionContext) {
       repos: repositories,
       reviewId: review?.id,
       reviewName: review?.name,
+      customCommand: review ? customArgsForCommand(review.command) : undefined,
       reviews,
       viewMode,
+      contextLines,
+      canExpandContext: review ? isDiffCommand(review.command) : false,
       patch,
       comments:
         review?.comments.map((c) => ({
@@ -140,6 +146,95 @@ export function activate(context: vscode.ExtensionContext) {
     (["uncommitted", "head", "stack"] as const).some(
       (mode) => presetCommand(mode) === command,
     );
+  const isDiffCommand = (command: string) => {
+    try {
+      return parseCommand(command)[0] === "diff";
+    } catch {
+      return false;
+    }
+  };
+  const quoteCommandArg = (arg: string): string =>
+    /^[A-Za-z0-9_./:@%+=,-]+$/.test(arg)
+      ? arg
+      : `'${arg.replaceAll("'", "'\\''")}'`;
+  const formatCommandArgs = (args: string[]): string =>
+    args.map(quoteCommandArg).join(" ");
+  const customArgsFromCommand = (
+    command: string,
+    rejectInternal = false,
+  ): string[] => {
+    const args = parseCommand(command);
+    const legacyFullCommand = args[0] === "diff";
+    const commandArgs = legacyFullCommand ? args.slice(1) : args;
+    const normalized: string[] = [];
+    let separator = false;
+    for (let index = 0; index < commandArgs.length; index += 1) {
+      const arg = commandArgs[index];
+      if (arg === "--") {
+        separator = true;
+        normalized.push(arg);
+        continue;
+      }
+      if (!separator && arg === "--git") {
+        if (rejectInternal && !legacyFullCommand)
+          throw new Error("Custom diff arguments must not include --git.");
+        continue;
+      }
+      if (!separator && (arg === "--unified" || arg === "-U")) {
+        if (rejectInternal && !legacyFullCommand)
+          throw new Error("Custom diff arguments must not include --unified.");
+        index += 1;
+        continue;
+      }
+      if (!separator && (/^--unified=/.test(arg) || /^-U\d+$/.test(arg))) {
+        if (rejectInternal && !legacyFullCommand)
+          throw new Error("Custom diff arguments must not include --unified.");
+        continue;
+      }
+      normalized.push(arg);
+    }
+    return normalized;
+  };
+  const canonicalCustomCommand = (input: string): string =>
+    formatCommandArgs([
+      "sl",
+      "diff",
+      "--git",
+      ...customArgsFromCommand(input, true),
+    ]);
+  const customArgsForCommand = (command: string): string => {
+    try {
+      return formatCommandArgs(customArgsFromCommand(command));
+    } catch {
+      return "";
+    }
+  };
+  const diffArgsWithContext = (command: string): string[] => {
+    const args = parseCommand(command);
+    if (args[0] !== "diff")
+      throw new Error("Only sl diff commands support context expansion.");
+    const normalized: string[] = [];
+    let separatorSeen = false;
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      if (arg === "--") separatorSeen = true;
+      if (!separatorSeen && (arg === "--unified" || arg === "-U")) {
+        index += 1;
+        continue;
+      }
+      if (!separatorSeen && (/^--unified=/.test(arg) || /^-U\d+$/.test(arg)))
+        continue;
+      normalized.push(arg);
+    }
+    const separator = normalized.indexOf("--");
+    normalized.splice(
+      separator < 0 ? normalized.length : separator,
+      0,
+      "--unified",
+      String(FULL_CONTEXT_LINES),
+    );
+    return normalized;
+  };
   type RequestedDiff = { choice?: string; command?: string };
   const commandForChoice = (requested: RequestedDiff): string => {
     switch (requested.choice) {
@@ -151,9 +246,8 @@ export function activate(context: vscode.ExtensionContext) {
         return presetCommand("stack");
       case "custom": {
         const command = requested.command?.trim();
-        if (!command) throw new Error("A custom Sapling command is required.");
-        parseCommand(command);
-        return command;
+        if (!command) throw new Error("Custom diff arguments are required.");
+        return canonicalCustomCommand(command);
       }
       default:
         throw new Error("Choose a Sapling diff preset.");
@@ -163,20 +257,52 @@ export function activate(context: vscode.ExtensionContext) {
     if (!review) return;
     if (!vscode.workspace.isTrusted)
       throw new Error("Trust this workspace before running Sapling commands.");
-    const command = requested ? commandForChoice(requested) : review.command;
+    const command = requested
+      ? commandForChoice(requested)
+      : isPreset(review.command)
+        ? review.command
+        : canonicalCustomCommand(review.command);
     const nextReview = { ...review, command };
     const next = await run(nextReview.repo, [
       "--color",
       "never",
-      ...parseCommand(command),
+      ...diffArgsWithContext(command),
     ]);
     validatePatch(next);
     const savedReview = { ...nextReview, patch: next };
     review = await store.save(savedReview);
     patch = next;
+    contextLines = FULL_CONTEXT_LINES;
     await remember();
     await send();
   }
+
+  // Older saved reviews may contain a truncated patch. Keep a one-time host
+  // fallback for their header-gap controls; current refreshes always fetch
+  // full context and expand locally in the webview.
+  async function expandContext(message: {
+    file?: unknown;
+    direction?: unknown;
+  }) {
+    if (!review || !isDiffCommand(review.command)) return;
+    if (!vscode.workspace.isTrusted)
+      throw new Error("Trust this workspace before expanding diff context.");
+    if (
+      typeof message.file !== "string" ||
+      !["above", "below", "between"].includes(String(message.direction))
+    )
+      return;
+    const next = await run(review.repo, [
+      "--color",
+      "never",
+      ...diffArgsWithContext(review.command),
+    ]);
+    validatePatch(next);
+    patch = next;
+    contextLines = FULL_CONTEXT_LINES;
+    await send();
+  }
+
   async function choose(custom = false, requested?: RequestedDiff) {
     if (!vscode.workspace.isTrusted)
       throw new Error("Trust this workspace before running Sapling commands.");
@@ -192,20 +318,31 @@ export function activate(context: vscode.ExtensionContext) {
         "No Sapling repositories found in the workspace folders.",
       );
     const last = context.workspaceState.get<{ repo: string }>("lastReview");
-    const repo =
-      review?.repo ??
-      (last && repositories.includes(last.repo) ? last.repo : repositories[0]);
+    let repo: string | undefined;
+    if (!review && repositories.length > 1) {
+      repo = await vscode.window.showQuickPick(repositories, {
+        placeHolder: "Choose a Sapling repository",
+      });
+      if (!repo) return;
+    } else {
+      repo =
+        review?.repo ??
+        (last && repositories.includes(last.repo)
+          ? last.repo
+          : repositories[0]);
+    }
+    if (!repo) throw new Error("No Sapling repository was selected.");
     const selected =
       review?.repo === repo ? review : await rememberedReview(repo);
     let command = presetCommand("uncommitted");
     if (requested) command = commandForChoice(requested);
     else if (custom) {
       const entered = await vscode.window.showInputBox({
-        title: "Sapling command producing a unified diff",
-        value: selected.command,
+        title: "Arguments for sl diff",
+        value: customArgsForCommand(selected.command),
         validateInput: (value) => {
           try {
-            parseCommand(value);
+            customArgsFromCommand(value, true);
             return undefined;
           } catch (e) {
             return String(e);
@@ -213,21 +350,27 @@ export function activate(context: vscode.ExtensionContext) {
         },
       });
       if (entered === undefined) return;
-      parseCommand(entered);
-      command = entered;
+      command = canonicalCustomCommand(entered);
     }
     const nextPatch = validatePatch(
-      await run(repo, ["--color", "never", ...parseCommand(command)]),
+      await run(repo, ["--color", "never", ...diffArgsWithContext(command)]),
     );
     review = await store.save({ ...selected, command, patch: nextPatch });
     patch = nextPatch;
+    contextLines = FULL_CONTEXT_LINES;
     await remember();
     ensurePanel();
     await send();
   }
   async function selectReview(repo: string, id: string) {
     review = await store.load(repo, id);
+    if (!isPreset(review.command) && isDiffCommand(review.command)) {
+      const normalized = canonicalCustomCommand(review.command);
+      if (normalized !== review.command)
+        review = await store.save({ ...review, command: normalized });
+    }
     patch = review.patch ?? "";
+    contextLines = FULL_CONTEXT_LINES;
     await remember();
     await send();
     if (isPreset(review.command) && vscode.workspace.isTrusted) await refresh();
@@ -456,6 +599,10 @@ export function activate(context: vscode.ExtensionContext) {
             else await choose(false, requested);
             return;
           }
+          if (message.type === "expandContext") {
+            await expandContext(message);
+            return;
+          }
           if (!review) return;
           switch (message.type) {
             case "selectReview": {
@@ -475,7 +622,10 @@ export function activate(context: vscode.ExtensionContext) {
                 name.trim() || "Untitled review",
                 review.command,
               );
-              review = await store.save({ ...next, patch });
+              review = await store.save({
+                ...next,
+                patch: review.patch ?? patch,
+              });
               await remember();
               await send();
               break;
@@ -536,7 +686,6 @@ export function activate(context: vscode.ExtensionContext) {
                 vscode.Uri.file(file),
               );
               const editor = await vscode.window.showTextDocument(document, {
-                viewColumn: vscode.ViewColumn.Beside,
                 preview: true,
               });
               const position = new vscode.Position(
@@ -544,7 +693,10 @@ export function activate(context: vscode.ExtensionContext) {
                 0,
               );
               editor.selection = new vscode.Selection(position, position);
-              editor.revealRange(new vscode.Range(position, position));
+              editor.revealRange(
+                new vscode.Range(position, position),
+                vscode.TextEditorRevealType.InCenterIfOutsideViewport,
+              );
               break;
             }
           }
