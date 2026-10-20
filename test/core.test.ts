@@ -4,6 +4,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  realpath,
   rm,
   symlink,
   writeFile,
@@ -14,6 +15,7 @@ import { afterEach, describe, it } from "node:test";
 
 import {
   commentStatus,
+  comparisonSnapshot,
   discoverRepositories,
   markdown,
   parseCommand,
@@ -103,7 +105,9 @@ describe("discoverRepositories", () => {
     );
     assert.deepEqual(
       found,
-      [resolve(first), resolve(nested), resolve(second)].sort(),
+      (
+        await Promise.all([first, nested, second].map((item) => realpath(item)))
+      ).sort(),
     );
   });
 
@@ -120,7 +124,7 @@ describe("discoverRepositories", () => {
       }
       return directory;
     });
-    assert.deepEqual(found, [resolve(good)]);
+    assert.deepEqual(found, [await realpath(good)]);
   });
 });
 
@@ -197,6 +201,64 @@ describe("commentStatus and markdown", () => {
     assert.match(output, /review-comment:c1/);
     assert.match(output, /Review: `Example review`/);
   });
+
+  it("validates comments against persisted expanded source ranges", () => {
+    const snapshot = comparisonSnapshot(
+      "/workspace/repo",
+      "/workspace/repo",
+      "sl diff --git --rev .",
+      ["--rev", "."],
+      ["--git", "--unified", "4"],
+      patch,
+    );
+    snapshot.sourceRanges.push({
+      id: "src/example.ts:between:1",
+      file: "src/example.ts",
+      oldStart: 10,
+      oldLines: ["persisted old"],
+      newStart: 10,
+      newLines: ["persisted new"],
+      sourceKey: "snapshot-key",
+    });
+    const expanded: Anchor = {
+      file: "src/example.ts",
+      side: "new",
+      start: 10,
+      end: 10,
+      text: ["persisted new"],
+    };
+    assert.equal(commentStatus(expanded, patch, snapshot), "current");
+    assert.equal(
+      commentStatus({ ...expanded, text: ["changed"] }, patch, snapshot),
+      "outdated",
+    );
+  });
+  it("never lets cached context hide a changed row or missing file", () => {
+    const snapshot = comparisonSnapshot(
+      "/repo",
+      "/repo",
+      "sl diff",
+      [],
+      [],
+      patch,
+    );
+    snapshot.sourceRanges.push({
+      id: "stale",
+      file: currentAnchor.file,
+      newStart: currentAnchor.start,
+      newLines: currentAnchor.text,
+      sourceKey: "old",
+    });
+    assert.equal(commentStatus(currentAnchor, "", snapshot), "outdated");
+    assert.equal(
+      commentStatus(
+        { ...currentAnchor, text: ["not the visible line"] },
+        patch,
+        snapshot,
+      ),
+      "outdated",
+    );
+  });
 });
 
 function legacyFilename(repo: string, command: string): string {
@@ -241,6 +303,26 @@ describe("ReviewStore", () => {
     assert.deepEqual(await store.load(review.repo, review.id), saved);
     const files = await (await import("node:fs/promises")).readdir(directory);
     assert.equal(files.filter((file) => file.endsWith(".json")).length, 1);
+  });
+
+  it("retains malformed siblings without blocking valid reviews", async () => {
+    const directory = await mkdtemp(
+      join(tmpdir(), "gm-review-corrupt-sibling-"),
+    );
+    temporaryDirectories.push(directory);
+    const store = new ReviewStore(directory);
+    const saved = await store.create("/repo", "Good");
+    await writeFile(join(directory, "broken.json"), "{broken");
+    await writeFile(
+      join(directory, "broken-legacy.json"),
+      JSON.stringify({ version: 1, repo: "/repo" }),
+    );
+    assert.equal((await store.load("/repo", saved.id)).name, "Good");
+    assert.equal((await store.list("/repo")).length, 1);
+    assert.equal(
+      await readFile(join(directory, "broken.json"), "utf8"),
+      "{broken",
+    );
   });
 
   it("creates, renames, changes command, and sorts summaries by update time", async () => {

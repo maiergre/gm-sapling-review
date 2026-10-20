@@ -6,7 +6,13 @@ type DiffSide = "old" | "new";
 type ViewMode = "split" | "inline";
 type ContextExpansionDirection = "above" | "below" | "between";
 
-const DEFAULT_CONTEXT_LINES = 3;
+const DEFAULT_CONTEXT_LINES = 4;
+/** Maximum number of lines requested for one context expansion. */
+const CONTEXT_EXPANSION_LINES = 30;
+/** Keep the initial review body bounded across all files. */
+const MAX_INITIAL_RENDERED_FILE_ROWS = 4000;
+/** Refuse to create an unbounded DOM even after an explicit reveal. */
+const MAX_HARD_RENDERED_FILE_ROWS = 100_000;
 
 export interface ReviewAnchor {
   file: string;
@@ -28,6 +34,7 @@ export interface ReviewComment {
 interface ReviewStateMessage {
   type: "state";
   repo?: string;
+  directory?: string;
   command?: string;
   reviewId?: string;
   reviewName?: string;
@@ -41,6 +48,56 @@ interface ReviewStateMessage {
   customCommand?: string;
   patch?: string;
   comments?: ReviewComment[];
+  /** Optional host metadata for bounded context and body loading. */
+  snapshotId?: string;
+  expandedRanges?: Array<{
+    id: string;
+    file: string;
+    direction: ContextExpansionDirection;
+    oldStart: number;
+    oldEnd: number;
+    newStart: number;
+    newEnd: number;
+  }>;
+  snapshot?: SnapshotMetadata;
+}
+
+interface ContextExpandedMessage {
+  type: "contextExpanded";
+  regionId?: string;
+  file?: string;
+  direction?: ContextExpansionDirection;
+  oldStart?: number;
+  oldEnd?: number;
+  newStart?: number;
+  newEnd?: number;
+  oldLines?: string[];
+  newLines?: string[];
+  patch?: string;
+  endOfFile?: boolean;
+}
+
+interface ContextErrorMessage {
+  type: "contextError";
+  regionId?: string;
+  message?: string;
+}
+
+interface SnapshotSourceRange {
+  endOfFile?: boolean;
+  id: string;
+  file: string;
+  oldStart?: number;
+  oldLines?: string[];
+  newStart?: number;
+  newLines?: string[];
+  sourceKey?: string;
+}
+
+interface SnapshotMetadata {
+  patch?: string;
+  expandedRanges?: ReviewStateMessage["expandedRanges"];
+  sourceRanges?: SnapshotSourceRange[];
 }
 
 interface ReviewSummary {
@@ -64,6 +121,7 @@ interface WebviewState {
   selection?: Selection;
   activeComposerKey?: string;
   editingComment?: string;
+  revealedFiles?: string[];
 }
 
 interface PersistedPending {
@@ -138,7 +196,12 @@ let draftAnchors: Record<string, ReviewAnchor> = {
   ...(restored.draftAnchors ?? {}),
 };
 let draftScopes: Record<string, string> = { ...(restored.draftScopes ?? {}) };
-let collapsed = new Set<string>(restored.collapsed ?? []);
+// Index-based fold keys from early versions are intentionally discarded. A
+// reordered diff must never apply an old fold choice to another file.
+let collapsed = new Set<string>(
+  (restored.collapsed ?? []).filter((key) => !/^\d+:/.test(key)),
+);
+let revealedFiles = new Set<string>(restored.revealedFiles ?? []);
 let pending = new Map<string, PendingSave>();
 let selection: Selection | undefined = restored.selection;
 let editingComment: string | undefined = restored.editingComment;
@@ -154,7 +217,11 @@ let reviewManager: HTMLElement | undefined;
 let reviewManagerSearch = "";
 let reviewManagerFocus: HTMLElement | null = null;
 let pendingContextExpansion: { id: string } | undefined;
+let pendingCommentNavigation: { id: string } | undefined;
 const expandedContextBlocks = new Set<string>();
+const exhaustedContextRegions = new Set<string>();
+const contextExpansionErrors = new Map<string, string>();
+const localExpansionProgress = new Map<string, { up: number; down: number }>();
 
 const PRESET_COMMANDS: Record<string, string> = {
   uncommitted: "sl diff --git --rev .",
@@ -209,6 +276,7 @@ function persist(): void {
       draftAnchors,
       draftScopes,
       collapsed: [...collapsed],
+      revealedFiles: [...revealedFiles],
       pending: [...pending.values()].map(
         ({ key, scope, id, body, anchor, deleting }) => ({
           key,
@@ -831,8 +899,33 @@ function sideFileName(
   return fileName(file);
 }
 
-function fileKey(name: string, index: number): string {
-  return `${index}:${name}`;
+function normalizeFilePath(value: string | undefined): string {
+  if (!value || value === "/dev/null") return "/dev/null";
+  return value
+    .replace(/^a\//, "")
+    .replace(/^b\//, "")
+    .replaceAll("\\", "/")
+    .replace(/^\.\//, "");
+}
+
+function fileIdentity(file: { oldName?: string; newName?: string }): string {
+  const oldName = normalizeFilePath(file.oldName);
+  const newName = normalizeFilePath(file.newName);
+  return `${oldName}→${newName}`;
+}
+
+function fileKey(file: { oldName?: string; newName?: string }): string {
+  return `file:${fileIdentity(file)}`;
+}
+
+function fileDisplayName(
+  file: { oldName?: string; newName?: string } | undefined,
+): string {
+  const oldName = normalizeFilePath(file?.oldName);
+  const newName = normalizeFilePath(file?.newName);
+  if (oldName !== "/dev/null" && newName !== "/dev/null" && oldName !== newName)
+    return `${oldName} → ${newName}`;
+  return fileName(file);
 }
 
 interface HunkRange {
@@ -854,12 +947,40 @@ interface AlignedContextRun {
   nextChange: boolean;
 }
 
+interface ContextBounds {
+  oldStart?: number;
+  oldEnd?: number;
+  newStart?: number;
+  newEnd?: number;
+}
+
+const contextExpansionIconPath =
+  "M11.854 10.146C12.049 10.341 12.049 10.658 11.854 10.853L8.35401 14.353C8.15901 14.548 7.84201 14.548 7.64701 14.353L4.14701 10.853C3.95201 10.658 3.95201 10.341 4.14701 10.146C4.34201 9.95098 4.65901 9.95098 4.85401 10.146L8.00001 13.293L11.146 10.146C11.341 9.95098 11.658 9.95098 11.853 10.146H11.854ZM4.85401 5.85398L8.00001 2.70798L11.146 5.85398C11.341 6.04898 11.658 6.04898 11.853 5.85398C12.048 5.65898 12.048 5.34198 11.853 5.14698L8.35301 1.64698C8.15801 1.45198 7.84101 1.45198 7.64601 1.64698L4.14601 5.14698C3.95101 5.34198 3.95101 5.65898 4.14601 5.85398C4.34101 6.04898 4.65901 6.04898 4.85401 5.85398Z";
+
 function contextBlockKey(
   file: string,
   direction: ContextExpansionDirection,
   ordinal: number,
+  bounds?: ContextBounds,
 ): string {
+  if (bounds) {
+    const values = [
+      bounds.oldStart,
+      bounds.oldEnd,
+      bounds.newStart,
+      bounds.newEnd,
+    ];
+    if (values.some((value) => value !== undefined))
+      return `${file}:${direction}:${bounds.oldStart ?? "_"}-${bounds.oldEnd ?? "_"}:${bounds.newStart ?? "_"}-${bounds.newEnd ?? "_"}`;
+  }
   return `${file}:${direction}:${ordinal}`;
+}
+
+function contextRegionKey(
+  file: string,
+  direction: ContextExpansionDirection,
+): string {
+  return `${file}:${direction}`;
 }
 
 function contextExpansionAvailable(): boolean {
@@ -901,8 +1022,118 @@ function lineRows(table: HTMLTableElement): HTMLTableRowElement[] {
   );
 }
 
+function contextBounds(
+  rows: HTMLTableRowElement[],
+  sideHint?: "old" | "new",
+): ContextBounds | undefined {
+  const old: number[] = [];
+  const next: number[] = [];
+  for (const row of rows) {
+    const numbers = row.querySelector<HTMLElement>(
+      ".d2h-code-linenumber, .d2h-code-side-linenumber",
+    );
+    const oldLine = parseLine(
+      numbers?.querySelector(".line-num1")?.textContent,
+    );
+    const newLine = parseLine(
+      numbers?.querySelector(".line-num2")?.textContent,
+    );
+    if (oldLine !== undefined) old.push(oldLine);
+    if (newLine !== undefined) next.push(newLine);
+    if (oldLine === undefined && newLine === undefined) {
+      const line = parseLine(numbers?.textContent);
+      if (line !== undefined) {
+        if (sideHint === "old") old.push(line);
+        else next.push(line);
+      }
+    }
+  }
+  if (!old.length && !next.length) return undefined;
+  return {
+    ...(old.length
+      ? { oldStart: Math.min(...old), oldEnd: Math.max(...old) }
+      : {}),
+    ...(next.length
+      ? { newStart: Math.min(...next), newEnd: Math.max(...next) }
+      : {}),
+  };
+}
+
+function combineContextBounds(
+  left: ContextBounds | undefined,
+  right: ContextBounds | undefined,
+): ContextBounds | undefined {
+  if (!left) return right;
+  if (!right) return left;
+  return {
+    ...(left.oldStart !== undefined || right.oldStart !== undefined
+      ? {
+          oldStart: Math.min(
+            left.oldStart ?? Number.POSITIVE_INFINITY,
+            right.oldStart ?? Number.POSITIVE_INFINITY,
+          ),
+          oldEnd: Math.max(left.oldEnd ?? 0, right.oldEnd ?? 0),
+        }
+      : {}),
+    ...(left.newStart !== undefined || right.newStart !== undefined
+      ? {
+          newStart: Math.min(
+            left.newStart ?? Number.POSITIVE_INFINITY,
+            right.newStart ?? Number.POSITIVE_INFINITY,
+          ),
+          newEnd: Math.max(left.newEnd ?? 0, right.newEnd ?? 0),
+        }
+      : {}),
+  };
+}
+
+function expandedContextCovers(
+  file: string,
+  direction: ContextExpansionDirection,
+  bounds: ContextBounds | undefined,
+): boolean {
+  if (!bounds) return false;
+  const covers = (range: ContextBounds): boolean =>
+    (bounds.oldStart === undefined ||
+      (range.oldStart !== undefined &&
+        range.oldEnd !== undefined &&
+        bounds.oldEnd !== undefined &&
+        range.oldStart <= bounds.oldStart &&
+        range.oldEnd >= bounds.oldEnd)) &&
+    (bounds.newStart === undefined ||
+      (range.newStart !== undefined &&
+        range.newEnd !== undefined &&
+        bounds.newEnd !== undefined &&
+        range.newStart <= bounds.newStart &&
+        range.newEnd >= bounds.newEnd));
+  if (
+    (review.expandedRanges ?? []).some(
+      (range) =>
+        range.file === file && range.direction === direction && covers(range),
+    )
+  )
+    return true;
+  const prefix = `${file}:${direction}:`;
+  return [...expandedContextBlocks].some((id) => {
+    if (!id.startsWith(prefix)) return false;
+    const match = id
+      .slice(prefix.length)
+      .match(/^(\d+|_)-(\d+|_):(\d+|_)-(\d+|_)$/);
+    if (!match) return false;
+    return covers({
+      ...(match[1] !== "_" ? { oldStart: Number(match[1]) } : {}),
+      ...(match[2] !== "_" ? { oldEnd: Number(match[2]) } : {}),
+      ...(match[3] !== "_" ? { newStart: Number(match[3]) } : {}),
+      ...(match[4] !== "_" ? { newEnd: Number(match[4]) } : {}),
+    });
+  });
+}
+
 function isChangedRow(row: HTMLTableRowElement): boolean {
-  return !!row.querySelector(".d2h-change, .d2h-del, .d2h-ins");
+  return (
+    row.matches(".d2h-change, .d2h-del, .d2h-ins") ||
+    !!row.querySelector(".d2h-change, .d2h-del, .d2h-ins")
+  );
 }
 
 function contextRuns(table: HTMLTableElement): ContextRun[] {
@@ -971,47 +1202,219 @@ function alignedContextRuns(tables: HTMLTableElement[]): AlignedContextRun[] {
   return runs;
 }
 
-function addContextExpansionRow(
-  reference: HTMLTableRowElement,
-  position: "before" | "after",
-  file: string,
-  direction: ContextExpansionDirection,
+type ContextExpansionEdge = "up" | "down";
+
+interface ContextExpansionAction {
+  file: string;
+  direction: ContextExpansionDirection;
+  edge: ContextExpansionEdge;
+  id: string;
+  needsHost: boolean;
+  hiddenLines?: number;
+  bounds?: ContextBounds;
+}
+
+function contextActionId(
   id: string,
-  needsHost = false,
-): void {
-  const row = document.createElement("tr");
-  row.className = "review-context-expansion-row";
-  const cell = document.createElement("td");
-  cell.className = "review-context-expansion-cell";
-  cell.colSpan = 2;
+  direction: ContextExpansionDirection,
+  edge: ContextExpansionEdge,
+): string {
+  // Preserve the identifiers used by older snapshots for the one-sided
+  // controls. Middle gaps need one identifier per edge so either side can be
+  // loaded and persisted independently.
+  return direction === "between" ? `${id}:${edge}` : id;
+}
+
+function contextActionExpanded(action: ContextExpansionAction): boolean {
+  return (
+    expandedContextBlocks.has(action.id) ||
+    expandedContextBlocks.has(
+      contextActionId(action.id, action.direction, action.edge),
+    )
+  );
+}
+
+function contextHeaderText(row: HTMLTableRowElement): string {
+  const content = row.querySelector<HTMLElement>(
+    ".d2h-code-line, .d2h-code-side-line",
+  );
+  return (content?.textContent ?? row.textContent ?? "")
+    .replace(/\u00a0/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function contextHeaderBefore(
+  table: HTMLTableElement,
+  row: HTMLTableRowElement,
+): string {
+  let header = "";
+  for (const candidate of hunkRows(table)) {
+    if (
+      candidate === row ||
+      !!(
+        candidate.compareDocumentPosition(row) &
+        Node.DOCUMENT_POSITION_FOLLOWING
+      )
+    )
+      header = contextHeaderText(candidate);
+  }
+  return header;
+}
+
+function contextIcon(edge: ContextExpansionEdge): SVGSVGElement {
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  for (const [key, value] of Object.entries({
+    viewBox: "0 0 16 16",
+    width: "16",
+    height: "16",
+    fill: "currentColor",
+    "aria-hidden": "true",
+    focusable: "false",
+  }))
+    svg.setAttribute(key, value);
+  svg.classList.add("codicon", "review-context-expansion-icon");
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute(
+    "d",
+    edge === "up"
+      ? "M8 1.25 2.75 6.5l1.06 1.06L7.25 4.18v8.57h1.5V4.18l3.44 3.38L13.25 6.5 8 1.25Z"
+      : "m8 14.75 5.25-5.25-1.06-1.06-3.44 3.38V3.25h-1.5v8.57L4.31 8.44 3.25 9.5 8 14.75Z",
+  );
+  svg.append(path);
+  return svg;
+}
+
+function contextExpansionButton(
+  action: ContextExpansionAction,
+): HTMLButtonElement {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "review-context-expansion-button";
-  button.dataset.reviewContextDirection = direction;
-  button.dataset.reviewContextFile = file;
-  button.dataset.reviewContextId = id;
-  if (needsHost) button.dataset.reviewContextNeedsHost = "true";
-  const label =
-    direction === "above"
-      ? "Show more unchanged lines above"
-      : direction === "below"
-        ? "Show more unchanged lines below"
-        : "Show more unchanged lines between hunks";
-  button.textContent = label;
-  button.setAttribute("aria-label", label);
-  button.title = label;
+  button.dataset.reviewContextDirection = action.direction;
+  button.dataset.reviewContextEdge = action.edge;
+  button.dataset.reviewContextExpansionEdge = action.edge;
+  button.dataset.reviewContextFile = action.file;
+  button.dataset.reviewContextId = action.id;
+  const actionId = contextActionId(action.id, action.direction, action.edge);
+  button.dataset.reviewContextActionId = actionId;
+  button.dataset.reviewContextLogicalId = action.id;
+  if (action.needsHost) button.dataset.reviewContextNeedsHost = "true";
+  if (action.hiddenLines !== undefined && action.hiddenLines > 0)
+    button.dataset.reviewContextHiddenLines = String(action.hiddenLines);
+  for (const [name, value] of Object.entries(action.bounds ?? {})) {
+    if (value !== undefined)
+      button.dataset[`reviewContext${name[0]!.toUpperCase()}${name.slice(1)}`] =
+        String(value);
+  }
+  const directionWord = action.edge === "up" ? "earlier" : "later";
+  const location =
+    action.direction === "between" ? " between hunks" : " in this file";
+  const count =
+    action.hiddenLines !== undefined && action.hiddenLines > 0
+      ? Math.min(action.hiddenLines, CONTEXT_EXPANSION_LINES)
+      : CONTEXT_EXPANSION_LINES;
+  const accessibleLabel = `Show ${count} ${directionWord} context line${count === 1 ? "" : "s"}${location}`;
+  button.setAttribute("aria-label", accessibleLabel);
+  button.title = accessibleLabel;
+  const label = document.createElement("span");
+  label.className = "review-context-expansion-label";
+  label.textContent = accessibleLabel;
+  button.append(contextIcon(action.edge), label);
   button.addEventListener("click", () =>
     requestContextExpansion(
-      file,
-      direction,
-      id,
-      button.dataset.reviewContextNeedsHost === "true",
+      action.file,
+      action.direction,
+      actionId,
+      action.needsHost,
     ),
   );
-  cell.append(button);
-  row.append(cell);
+  return button;
+}
+
+function expansionCells(
+  reference: HTMLTableRowElement,
+  header: string,
+): { gutter: HTMLTableCellElement; code: HTMLTableCellElement } {
+  const sourceGutter = reference.cells[0];
+  const sourceCode = reference.cells[1];
+  const gutter = document.createElement("td");
+  gutter.className = `${sourceGutter?.className ?? "d2h-code-linenumber d2h-info"} review-context-expansion-gutter`;
+  gutter.replaceChildren();
+  const code = document.createElement("td");
+  code.className = `${sourceCode?.className ?? "d2h-info"} review-context-expansion-code`;
+  const codeLine = document.createElement("div");
+  codeLine.className =
+    sourceCode?.querySelector<HTMLElement>(
+      ".d2h-code-line, .d2h-code-side-line",
+    )?.className ?? "d2h-code-line";
+  codeLine.textContent = header || "@@";
+  code.append(codeLine);
+  return { gutter, code };
+}
+
+function addContextExpansionRow(
+  reference: HTMLTableRowElement,
+  position: "before" | "after",
+  actions: ContextExpansionAction[],
+  header: string,
+): HTMLTableRowElement {
+  const row = document.createElement("tr");
+  row.className = "review-context-expansion-row";
+  row.dataset.reviewContextSeparator = "true";
+  const { gutter, code } = expansionCells(reference, header);
+  for (const action of actions) gutter.append(contextExpansionButton(action));
+  const error = actions
+    .map(
+      (action) =>
+        contextExpansionErrors.get(action.id) ??
+        contextExpansionErrors.get(
+          contextActionId(action.id, action.direction, action.edge),
+        ),
+    )
+    .find((message): message is string => !!message);
+  if (error) {
+    const errorMessage = document.createElement("span");
+    errorMessage.className = "review-context-expansion-error";
+    errorMessage.setAttribute("role", "alert");
+    errorMessage.textContent = error;
+    code.append(errorMessage);
+  }
+  row.append(gutter, code);
   if (position === "before") reference.before(row);
   else reference.after(row);
+  return row;
+}
+
+function decorateHunkRow(
+  row: HTMLTableRowElement,
+  actions: ContextExpansionAction[],
+  header: string,
+): void {
+  const { gutter, code } = expansionCells(row, header);
+  // Keep the marker row in the table. It is the separator and carries the
+  // actual @@ header in the content column, so controls never stack beside a
+  // second hidden marker.
+  row.classList.add("review-context-expansion-row");
+  row.dataset.reviewContextSeparator = "true";
+  row.replaceChildren(gutter, code);
+  for (const action of actions) gutter.append(contextExpansionButton(action));
+  const error = actions
+    .map(
+      (action) =>
+        contextExpansionErrors.get(action.id) ??
+        contextExpansionErrors.get(
+          contextActionId(action.id, action.direction, action.edge),
+        ),
+    )
+    .find((message): message is string => !!message);
+  if (error) {
+    const errorMessage = document.createElement("span");
+    errorMessage.className = "review-context-expansion-error";
+    errorMessage.setAttribute("role", "alert");
+    errorMessage.textContent = error;
+    code.append(errorMessage);
+  }
 }
 
 function requestContextExpansion(
@@ -1021,16 +1424,70 @@ function requestContextExpansion(
   needsHost = false,
 ): void {
   if (!contextExpansionAvailable()) return;
+  contextExpansionErrors.delete(id);
   if (needsHost) {
     pendingContextExpansion = { id };
     showInfo("Loading more unchanged lines…");
+    const button = [
+      ...document.querySelectorAll<HTMLButtonElement>(
+        ".review-context-expansion-button",
+      ),
+    ].find(
+      (candidate) =>
+        candidate.dataset.reviewContextActionId === id ||
+        candidate.dataset.reviewContextId === id,
+    );
+    const number = (name: string): number | undefined => {
+      const value = Number(button?.dataset[name]);
+      return Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+    };
     send({
       type: "expandContext",
       file,
       direction,
-      contextLines: 1_000_000,
+      regionId: id,
+      ...(number("reviewContextOldStart") !== undefined
+        ? { oldStart: number("reviewContextOldStart") }
+        : {}),
+      ...(number("reviewContextOldEnd") !== undefined
+        ? { oldEnd: number("reviewContextOldEnd") }
+        : {}),
+      ...(number("reviewContextNewStart") !== undefined
+        ? { newStart: number("reviewContextNewStart") }
+        : {}),
+      ...(number("reviewContextNewEnd") !== undefined
+        ? { newEnd: number("reviewContextNewEnd") }
+        : {}),
     });
     return;
+  }
+  const button = [
+    ...document.querySelectorAll<HTMLButtonElement>(
+      ".review-context-expansion-button",
+    ),
+  ].find(
+    (candidate) =>
+      candidate.dataset.reviewContextActionId === id ||
+      candidate.dataset.reviewContextId === id,
+  );
+  if (button) {
+    const logicalId = button.dataset.reviewContextLogicalId ?? id;
+    const edge = button.dataset.reviewContextEdge as
+      ContextExpansionEdge | undefined;
+    if (edge === "up" || edge === "down") {
+      const progress = localExpansionProgress.get(logicalId) ?? {
+        up: 0,
+        down: 0,
+      };
+      const hidden = Number(button.dataset.reviewContextHiddenLines);
+      progress[edge] += Math.min(
+        CONTEXT_EXPANSION_LINES,
+        Number.isSafeInteger(hidden) && hidden > 0
+          ? hidden
+          : CONTEXT_EXPANSION_LINES,
+      );
+      localExpansionProgress.set(logicalId, progress);
+    }
   }
   expandedContextBlocks.add(id);
   renderDiff();
@@ -1043,19 +1500,24 @@ function decorateContextExpansion(
   parsedFile: ReturnType<typeof parse>[number] | undefined,
 ): void {
   if (!contextExpansionAvailable() || !tables.length) return;
-  const controls = new Set<string>();
-  const add = (
+  const actionIsAvailable = (action: ContextExpansionAction): boolean =>
+    (!action.needsHost || !contextActionExpanded(action)) &&
+    !(
+      action.needsHost &&
+      exhaustedContextRegions.has(
+        contextRegionKey(action.file, action.direction),
+      )
+    ) &&
+    !expandedContextCovers(action.file, action.direction, action.bounds);
+  const addActions = (
     reference: HTMLTableRowElement,
     position: "before" | "after",
-    direction: ContextExpansionDirection,
-    id: string,
-    table?: HTMLTableElement,
-    needsHost = false,
+    actions: ContextExpansionAction[],
+    header: string,
   ) => {
-    const controlKey = `${table ? tables.indexOf(table) : 0}:${id}`;
-    if (controls.has(controlKey) || expandedContextBlocks.has(id)) return;
-    controls.add(controlKey);
-    addContextExpansionRow(reference, position, file, direction, id, needsHost);
+    const available = actions.filter(actionIsAvailable);
+    if (!available.length) return;
+    addContextExpansionRow(reference, position, available, header);
   };
 
   const hasCommentInRows = (rows: HTMLTableRowElement[]): boolean => {
@@ -1081,6 +1543,24 @@ function decorateContextExpansion(
     );
   };
 
+  const actionFor = (
+    direction: ContextExpansionDirection,
+    edge: ContextExpansionEdge,
+    id: string,
+    bounds: ContextBounds | undefined,
+    needsHost: boolean,
+    hiddenLines?: number,
+  ): ContextExpansionAction => ({
+    file,
+    direction,
+    edge,
+    id,
+    needsHost,
+    hiddenLines,
+    bounds,
+  });
+
+  let localTailCollapsed = false;
   const collapseRun = (
     runIndex: number,
     rowsByTable: Array<Array<HTMLTableRowElement | undefined>>,
@@ -1092,109 +1572,255 @@ function decorateContextExpansion(
     );
     if (!allRows.length) return;
     const runLength = Math.max(...rowsByTable.map((rows) => rows.length), 0);
-    const direction: ContextExpansionDirection = previousChange
-      ? nextChange
-        ? "between"
-        : "below"
-      : "above";
-    const id = contextBlockKey(file, direction, runIndex);
     const keepBefore = previousChange ? DEFAULT_CONTEXT_LINES : 0;
     const keepAfter = nextChange ? DEFAULT_CONTEXT_LINES : 0;
     const hiddenStart = keepBefore;
     const hiddenEnd = runLength - keepAfter;
     if (
       hiddenStart >= hiddenEnd ||
-      expandedContextBlocks.has(id) ||
-      hasCommentInRows(allRows)
+      hasCommentInRows(allRows) ||
+      hiddenEnd - hiddenStart <= 0
     )
       return;
+    const direction: ContextExpansionDirection = previousChange
+      ? nextChange
+        ? "between"
+        : "below"
+      : "above";
+    // A source-backed gap owns a separator at its hunk marker. Leave the
+    // leading context visible in that case so it cannot produce two controls
+    // for the same gap. Local trailing context still collapses and becomes
+    // the next visible edge of the file.
+    if (!previousChange && !(review.expandedRanges?.length ?? 0)) {
+      const firstHunk = hunkRows(tables[0])[0];
+      const firstRange = firstHunk ? parseHunkRange(firstHunk) : undefined;
+      if (firstRange && (firstRange.oldStart > 1 || firstRange.newStart > 1))
+        return;
+    }
+    const logicalId = contextBlockKey(file, direction, runIndex);
+    const progress = localExpansionProgress.get(logicalId) ?? {
+      up: 0,
+      down: 0,
+    };
+    const revealUp = Math.min(progress.up, hiddenEnd - hiddenStart);
+    const revealDown = Math.min(
+      progress.down,
+      Math.max(0, hiddenEnd - hiddenStart - revealUp),
+    );
+    // The up action reveals the rows nearest the lower hunk; the down action
+    // reveals the rows nearest the upper hunk. Keep the other edge collapsed.
+    const remainingStart = hiddenStart + revealDown;
+    const remainingEnd = hiddenEnd - revealUp;
+    if (remainingStart >= remainingEnd) return;
+    const hiddenRows = rowsByTable.flatMap((rows) =>
+      rows
+        .slice(remainingStart, remainingEnd)
+        .filter((row): row is HTMLTableRowElement => row !== undefined),
+    );
+    if (!hiddenRows.length) return;
+    const bounds = rowsByTable.reduce<ContextBounds | undefined>(
+      (current, rows, tableIndex) =>
+        combineContextBounds(
+          current,
+          contextBounds(
+            rows
+              .slice(remainingStart, remainingEnd)
+              .filter((row): row is HTMLTableRowElement => row !== undefined),
+            tables.length > 1 ? (tableIndex === 0 ? "old" : "new") : undefined,
+          ),
+        ),
+      undefined,
+    );
+    const edges: ContextExpansionEdge[] =
+      direction === "between"
+        ? ["up", "down"]
+        : [direction === "above" ? "up" : "down"];
+    const actions = edges.map((edge) =>
+      actionFor(
+        direction,
+        edge,
+        logicalId,
+        bounds,
+        false,
+        remainingEnd - remainingStart,
+      ),
+    );
     for (const rows of rowsByTable) {
-      for (const row of rows.slice(hiddenStart, hiddenEnd))
+      for (const row of rows.slice(remainingStart, remainingEnd))
         if (row) row.hidden = true;
     }
+    if (direction === "below") localTailCollapsed = true;
     rowsByTable.forEach((rows, tableIndex) => {
       const table = tables[tableIndex];
       const reference =
-        rows[hiddenStart] ??
-        [...rows]
-          .reverse()
-          .find((row): row is HTMLTableRowElement => row !== undefined);
-      if (reference) add(reference, "before", direction, id, table);
+        rows[remainingEnd] ?? rows[remainingStart - 1] ?? rows.at(-1);
+      if (!reference) return;
+      const header = contextHeaderBefore(table, reference);
+      addActions(
+        reference,
+        rows[remainingEnd] ? "before" : "after",
+        actions,
+        header,
+      );
     });
   };
 
-  if (tables.length > 1) {
-    for (const [runIndex, run] of alignedContextRuns(tables).entries()) {
-      collapseRun(
-        runIndex,
-        run.rowsByTable,
-        run.previousChange,
-        run.nextChange,
-      );
-    }
-  } else {
-    for (const [runIndex, run] of contextRuns(tables[0]).entries()) {
-      if (!run.rows.length) continue;
-      collapseRun(runIndex, [run.rows], !!run.previousChange, !!run.nextChange);
+  // Source-backed expansions already return bounded synthetic hunks. Keeping
+  // their rows visible lets the rendered hunk ranges describe every remaining
+  // gap, including when the user alternates between its two edges.
+  if (!(review.expandedRanges?.length ?? 0)) {
+    if (tables.length > 1) {
+      for (const [runIndex, run] of alignedContextRuns(tables).entries())
+        collapseRun(
+          runIndex,
+          run.rowsByTable,
+          run.previousChange,
+          run.nextChange,
+        );
+    } else {
+      for (const [runIndex, run] of contextRuns(tables[0]).entries())
+        collapseRun(
+          runIndex,
+          [run.rows],
+          !!run.previousChange,
+          !!run.nextChange,
+        );
     }
   }
 
-  const primaryHunks = hunkRows(tables[0]);
+  // Capture marker rows before replacing any of them with separator content.
+  // In split mode both panes must receive the same logical action, even while
+  // the first pane is being decorated.
+  const hunkRowsByTable = tables.map(hunkRows);
+  const primaryHunks = hunkRowsByTable[0] ?? [];
   const ranges = primaryHunks.map(parseHunkRange);
   if (ranges.some((range) => !range) || !ranges.length) return;
-  const changes = parsedFile?.blocks.map((block) => {
-    const changed = block.lines.filter((line) => line.type !== "context");
-    const values = changed.flatMap((line) =>
-      [line.newNumber, line.oldNumber].filter(
-        (value): value is number => value !== undefined,
-      ),
-    );
-    if (!values.length) return undefined;
-    return `${Math.min(...values)}-${Math.max(...values)}`;
-  });
-  const firstChange = changes?.find((change) => change !== undefined);
-  const changeGroupCount =
-    parsedFile?.blocks.reduce((count, block) => {
-      let changed = false;
-      for (const line of block.lines) {
-        if (line.type === "context") changed = false;
-        else if (!changed) {
-          count += 1;
-          changed = true;
-        }
-      }
-      return count;
-    }, 0) ?? 0;
-  const addBeforeHunk = (
-    index: number,
-    direction: ContextExpansionDirection,
-    id: string,
-  ) => {
-    for (const table of tables) {
-      const rows = hunkRows(table);
-      if (rows[index]) add(rows[index], "before", direction, id, table, true);
+  const headers = primaryHunks.map(contextHeaderText);
+  const hasChanged =
+    parsedFile?.blocks.some((block) =>
+      block.lines.some((line) => line.type !== "context"),
+    ) ?? tables.some((table) => lineRows(table).some(isChangedRow));
+  if (!hasChanged) return;
+  const rangeEnd = (start: number, count: number): number => start + count;
+  const gap = (
+    previous: HunkRange | undefined,
+    current: HunkRange,
+  ): ContextBounds | undefined => {
+    const oldStart = previous
+      ? rangeEnd(previous.oldStart, previous.oldCount)
+      : 1;
+    const newStart = previous
+      ? rangeEnd(previous.newStart, previous.newCount)
+      : 1;
+    const oldEnd = current.oldStart - 1;
+    const newEnd = current.newStart - 1;
+    if (oldEnd < oldStart && newEnd < newStart) return undefined;
+    return {
+      ...(oldEnd >= oldStart ? { oldStart, oldEnd } : {}),
+      ...(newEnd >= newStart ? { newStart, newEnd } : {}),
+    };
+  };
+  const edgeBounds = (
+    bounds: ContextBounds,
+    edge: ContextExpansionEdge,
+  ): ContextBounds => {
+    const slice = (start: number | undefined, end: number | undefined) => {
+      if (start === undefined || end === undefined || end < start) return {};
+      return edge === "up"
+        ? {
+            start: Math.max(start, end - CONTEXT_EXPANSION_LINES + 1),
+            end,
+          }
+        : {
+            start,
+            end: Math.min(end, start + CONTEXT_EXPANSION_LINES - 1),
+          };
+    };
+    const old = slice(bounds.oldStart, bounds.oldEnd);
+    const next = slice(bounds.newStart, bounds.newEnd);
+    return {
+      ...(old.start !== undefined
+        ? { oldStart: old.start, oldEnd: old.end }
+        : {}),
+      ...(next.start !== undefined
+        ? { newStart: next.start, newEnd: next.end }
+        : {}),
+    };
+  };
+  const addHunkActions = (index: number, actions: ContextExpansionAction[]) => {
+    for (const [tableIndex] of tables.entries()) {
+      const row = hunkRowsByTable[tableIndex]?.[index];
+      if (!row) continue;
+      decorateHunkRow(
+        row,
+        actions.filter(actionIsAvailable),
+        headers[index] ?? contextHeaderText(row),
+      );
     }
   };
-  const first = ranges[0]!;
-  if ((first.oldStart > 1 || first.newStart > 1) && firstChange) {
-    addBeforeHunk(0, "above", contextBlockKey(file, "above", 0));
+
+  const firstGap = gap(undefined, ranges[0]!);
+  if (firstGap) {
+    const bounds = edgeBounds(firstGap, "up");
+    const baseId = contextBlockKey(file, "above", 0, bounds);
+    addHunkActions(0, [
+      actionFor(
+        "above",
+        "up",
+        baseId,
+        bounds,
+        true,
+        Math.max(
+          firstGap.oldEnd !== undefined
+            ? firstGap.oldEnd - firstGap.oldStart! + 1
+            : 0,
+          firstGap.newEnd !== undefined
+            ? firstGap.newEnd - firstGap.newStart! + 1
+            : 0,
+        ),
+      ),
+    ]);
   }
   for (let index = 1; index < ranges.length; index += 1) {
-    const previous = ranges[index - 1]!;
-    const current = ranges[index]!;
-    const oldGap = current.oldStart - (previous.oldStart + previous.oldCount);
-    const newGap = current.newStart - (previous.newStart + previous.newCount);
-    if (oldGap <= 0 && newGap <= 0) continue;
-    if (!changes?.[index - 1] || !changes[index]) continue;
-    const id = contextBlockKey(file, "between", index);
-    addBeforeHunk(index, "between", id);
+    const bounds = gap(ranges[index - 1], ranges[index]!);
+    if (!bounds) continue;
+    const baseId = contextBlockKey(file, "between", index, bounds);
+    const hiddenLines = Math.max(
+      bounds.oldEnd !== undefined ? bounds.oldEnd - bounds.oldStart! + 1 : 0,
+      bounds.newEnd !== undefined ? bounds.newEnd - bounds.newStart! + 1 : 0,
+    );
+    addHunkActions(
+      index,
+      (["up", "down"] as ContextExpansionEdge[]).map((edge) =>
+        actionFor(
+          "between",
+          edge,
+          baseId,
+          edgeBounds(bounds, edge),
+          true,
+          hiddenLines,
+        ),
+      ),
+    );
   }
-  if (changeGroupCount) {
-    const id = contextBlockKey(file, "below", changeGroupCount);
+
+  if (!localTailCollapsed) {
+    const last = ranges.at(-1)!;
+    const oldStart = rangeEnd(last.oldStart, last.oldCount);
+    const newStart = rangeEnd(last.newStart, last.newCount);
+    const bounds: ContextBounds = {
+      oldStart,
+      oldEnd: oldStart + CONTEXT_EXPANSION_LINES - 1,
+      newStart,
+      newEnd: newStart + CONTEXT_EXPANSION_LINES - 1,
+    };
+    const baseId = contextBlockKey(file, "below", ranges.length, bounds);
+    const actions = [actionFor("below", "down", baseId, bounds, true)];
     for (const table of tables) {
       const rows = lineRows(table);
-      const target = rows.at(-1) ?? hunkRows(table).at(-1);
-      if (target) add(target, "after", "below", id, table, true);
+      const target =
+        rows.at(-1) ?? hunkRowsByTable[tables.indexOf(table)]?.at(-1);
+      if (target) addActions(target, "after", actions, headers.at(-1) ?? "@@");
     }
   }
 }
@@ -1317,6 +1943,102 @@ function appendTocDirectory(
   }
 }
 
+function fileBodyRowCount(file: ReturnType<typeof parse>[number]): number {
+  return file.blocks.reduce((count, block) => count + block.lines.length, 0);
+}
+
+function shouldGateFile(file: ReturnType<typeof parse>[number]): boolean {
+  const rows = fileBodyRowCount(file);
+  // Deleted files are commonly all changed lines, so their body can be much
+  // larger than a normal hunk while still looking like a small diff header.
+  // Gate every oversized body and always gate a deleted body over the limit.
+  return rows > MAX_INITIAL_RENDERED_FILE_ROWS;
+}
+
+/**
+ * Keep the file header and metadata for a gated file while omitting its hunks
+ * before Diff2Html builds any rows. The complete patch stays in `review.patch`
+ * and is rendered only after the reviewer explicitly reveals that file.
+ */
+function patchForVisibleFiles(patch: string, gated: Set<number>): string {
+  if (!gated.size) return patch;
+  const sections = patch.split(/(?=^diff --git )/m);
+  let fileIndex = -1;
+  return sections
+    .map((section) => {
+      if (!/^diff --git /m.test(section)) return section;
+      fileIndex += 1;
+      if (!gated.has(fileIndex)) return section;
+      const lines = section.split("\n");
+      const hunk = lines.findIndex((line) => /^@@/.test(line));
+      if (hunk < 0) return section;
+      const prefix = lines.slice(0, hunk).join("\n");
+      return `${prefix}\n`;
+    })
+    .join("");
+}
+
+function fileMatchesAnchor(
+  wrapper: HTMLElement | undefined,
+  file: string,
+): boolean {
+  if (!wrapper) return false;
+  return [
+    wrapper.dataset.reviewFile,
+    wrapper.dataset.reviewOldFile,
+    wrapper.dataset.reviewNewFile,
+  ].includes(file);
+}
+
+function gatedFileLabel(file: ReturnType<typeof parse>[number]): string {
+  const count = fileBodyRowCount(file);
+  if (count > MAX_HARD_RENDERED_FILE_ROWS)
+    return `File too large to render (${count.toLocaleString()} lines)`;
+  const noun = file.isDeleted ? "deleted file" : "file";
+  return `Show ${noun} (${count.toLocaleString()} lines)`;
+}
+
+function decorateGatedFile(
+  wrapper: HTMLElement,
+  file: ReturnType<typeof parse>[number],
+  key: string,
+  force = false,
+): void {
+  const hardLimited = fileBodyRowCount(file) > MAX_HARD_RENDERED_FILE_ROWS;
+  if (
+    (!force && !shouldGateFile(file) && !hardLimited) ||
+    (revealedFiles.has(key) && !hardLimited)
+  )
+    return;
+  const header = wrapper.querySelector<HTMLElement>(".d2h-file-header");
+  if (!header) return;
+  const controls = document.createElement("div");
+  controls.className = "review-large-file-gate";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "review-large-file-button";
+  button.textContent = gatedFileLabel(file);
+  button.title = hardLimited
+    ? "This file is too large to render in the review"
+    : "Render this file's complete diff";
+  button.setAttribute("aria-label", button.textContent);
+  button.dataset.reviewRevealFile = key;
+  if (hardLimited) button.dataset.reviewHardLimit = "true";
+  button.addEventListener("click", () => {
+    if (hardLimited) {
+      showError(
+        `${fileDisplayName(file)} has ${fileBodyRowCount(file).toLocaleString()} lines and exceeds the ${MAX_HARD_RENDERED_FILE_ROWS.toLocaleString()}-line render limit. Narrow the diff to review it here.`,
+      );
+      return;
+    }
+    revealedFiles.add(key);
+    persist();
+    renderDiff();
+  });
+  controls.append(button);
+  header.after(controls);
+}
+
 function renderDiff(): void {
   diff.replaceChildren();
   const patch = review.patch ?? "";
@@ -1353,6 +2075,36 @@ function renderDiff(): void {
   toc.append(tocList);
   diff.append(toc);
 
+  const gatedFiles = new Set<number>();
+  let initialRows = 0;
+  files.forEach((file, index) => {
+    const rows = fileBodyRowCount(file);
+    const key = fileKey(file);
+    const hardLimited = rows > MAX_HARD_RENDERED_FILE_ROWS;
+    const explicitlyRevealed = revealedFiles.has(key) && !hardLimited;
+    if (
+      hardLimited ||
+      (!explicitlyRevealed &&
+        (rows > MAX_INITIAL_RENDERED_FILE_ROWS ||
+          initialRows + rows > MAX_INITIAL_RENDERED_FILE_ROWS))
+    ) {
+      gatedFiles.add(index);
+      return;
+    }
+    initialRows += rows;
+  });
+  const visiblePatch = patchForVisibleFiles(patch, gatedFiles);
+  let visibleFiles: ReturnType<typeof parse> = files;
+  if (visiblePatch !== patch) {
+    try {
+      visibleFiles = parse(visiblePatch);
+    } catch {
+      // A malformed hand-written patch should still get Diff2Html's normal
+      // error/fallback path rather than losing the complete review.
+      visibleFiles = files;
+    }
+  }
+
   const output = document.createElement("div");
   output.className = "review-diff-output";
   diff.append(output);
@@ -1360,7 +2112,7 @@ function renderDiff(): void {
   try {
     // Diff2HtmlUI's regular build includes the complete highlight.js language
     // registry. draw() calls highlightCode() with that registry.
-    const ui = new Diff2HtmlUI(output, patch, {
+    const ui = new Diff2HtmlUI(output, visiblePatch, {
       drawFileList: false,
       outputFormat: mode === "split" ? "side-by-side" : "line-by-line",
       matching: "lines",
@@ -1385,27 +2137,31 @@ function renderDiff(): void {
   ];
   const tocRoot: TocDirectory = { directories: new Map(), files: [] };
   wrappers.forEach((wrapper, index) => {
-    const name = fileName(files[index]);
-    const key = fileKey(name, index);
+    const sourceFile = files[index];
+    const renderedFile = visibleFiles[index];
+    const name = fileName(sourceFile);
+    const oldName = sideFileName(sourceFile, "old");
+    const newName = sideFileName(sourceFile, "new");
+    const key = sourceFile ? fileKey(sourceFile) : `file:${name}`;
     wrapper.id = `review-file-${index}`;
     wrapper.dataset.reviewFile = name;
+    wrapper.dataset.reviewOldFile = oldName;
+    wrapper.dataset.reviewNewFile = newName;
     wrapper.dataset.reviewFileKey = key;
     if (/\.(?:md|markdown)$/i.test(name)) {
       wrapper.classList.add("review-markdown-file");
       stripMarkdownIntralineMarkup(wrapper);
     }
-    decorateFileHeader(wrapper, name, key, files[index]);
-    decorateLines(
-      wrapper,
-      sideFileName(files[index], "old"),
-      sideFileName(files[index], "new"),
-    );
+    decorateFileHeader(wrapper, name, key, sourceFile);
+    decorateLines(wrapper, oldName, newName);
     decorateContextExpansion(
       wrapper,
       name,
       [...wrapper.querySelectorAll<HTMLTableElement>(".d2h-diff-table")],
-      files[index],
+      renderedFile,
     );
+    if (sourceFile && gatedFiles.has(index))
+      decorateGatedFile(wrapper, sourceFile, key, true);
 
     const parts = name.split("/").filter(Boolean);
     let directory = tocRoot;
@@ -1478,7 +2234,10 @@ function decorateFileHeader(
   }
 
   const renderedName = header.querySelector<HTMLElement>(".d2h-file-name");
-  if (renderedName) renderedName.textContent = name;
+  if (renderedName) {
+    renderedName.textContent = fileDisplayName(file) || name;
+    renderedName.title = fileDisplayName(file) || name;
+  }
   const toggle = document.createElement("button");
   toggle.type = "button";
   toggle.className = "review-file-toggle";
@@ -1504,7 +2263,9 @@ function applyCollapsed(
   toggle.title = isCollapsed ? "Expand file" : "Fold file";
   toggle.setAttribute(
     "aria-label",
-    isCollapsed ? `Expand ${key}` : `Fold ${key}`,
+    isCollapsed
+      ? `Expand ${wrapper.dataset.reviewFile ?? key}`
+      : `Fold ${wrapper.dataset.reviewFile ?? key}`,
   );
   toggle.setAttribute("aria-expanded", String(!isCollapsed));
 }
@@ -1901,11 +2662,22 @@ function deleteComment(comment: ReviewComment): void {
 }
 
 function jumpToComment(id: string): void {
+  const comment = review.comments?.find((item) => item.id === id);
+  if (!comment) return;
   const card = [
     ...document.querySelectorAll<HTMLElement>(".review-comment"),
   ].find((element) => element.dataset.commentId === id);
   if (!card) return;
-  const wrapper = card.closest<HTMLElement>(".d2h-file-wrapper");
+  if (comment.status === "outdated") {
+    card.scrollIntoView({ block: "center" });
+    card.focus({ preventScroll: true });
+    return;
+  }
+  const wrapper =
+    card.closest<HTMLElement>(".d2h-file-wrapper") ??
+    [...diff.querySelectorAll<HTMLElement>(".d2h-file-wrapper")].find(
+      (candidate) => fileMatchesAnchor(candidate, comment.anchor.file),
+    );
   const key = wrapper?.dataset.reviewFileKey;
   const toggle = wrapper?.querySelector<HTMLButtonElement>(
     ".review-file-toggle",
@@ -1914,6 +2686,78 @@ function jumpToComment(id: string): void {
     applyCollapsed(wrapper, toggle, key);
     persist();
     alignSplitThreads();
+  }
+
+  const anchor = [
+    ...diff.querySelectorAll<HTMLElement>("[data-review-side]"),
+  ].find(
+    (element) =>
+      fileMatchesAnchor(
+        element.closest<HTMLElement>(".d2h-file-wrapper")!,
+        comment.anchor.file,
+      ) &&
+      element.dataset.reviewSide === comment.anchor.side &&
+      element.dataset.reviewLine === String(comment.anchor.end),
+  );
+  if (!anchor) {
+    const gate = wrapper?.querySelector<HTMLButtonElement>(
+      "[data-review-reveal-file]",
+    );
+    if (gate) {
+      if (gate.dataset.reviewHardLimit === "true") {
+        pendingCommentNavigation = undefined;
+        gate.click();
+        return;
+      }
+      pendingCommentNavigation = { id };
+      gate.click();
+      const pendingNavigation = pendingCommentNavigation;
+      pendingCommentNavigation = undefined;
+      if (pendingNavigation && key && revealedFiles.has(key))
+        jumpToComment(pendingNavigation.id);
+      return;
+    }
+    const control = wrapper
+      ? ([
+          ...wrapper.querySelectorAll<HTMLButtonElement>(
+            ".review-context-expansion-button",
+          ),
+        ].find((button) => {
+          const line = comment.anchor.start;
+          const start = Number(
+            button.dataset[
+              comment.anchor.side === "old"
+                ? "reviewContextOldStart"
+                : "reviewContextNewStart"
+            ],
+          );
+          const end = Number(
+            button.dataset[
+              comment.anchor.side === "old"
+                ? "reviewContextOldEnd"
+                : "reviewContextNewEnd"
+            ],
+          );
+          if (Number.isFinite(start) && Number.isFinite(end))
+            return line >= start && line <= end;
+          return false;
+        }) ??
+        wrapper.querySelector<HTMLButtonElement>(
+          ".review-context-expansion-button",
+        ))
+      : undefined;
+    if (control) {
+      pendingCommentNavigation = { id };
+      control.click();
+      // Webview-local expansion rerenders synchronously. Host expansion will
+      // retry from onState after its bounded range arrives.
+      if (!pendingContextExpansion) {
+        const pendingNavigation = pendingCommentNavigation;
+        pendingCommentNavigation = undefined;
+        if (pendingNavigation) jumpToComment(pendingNavigation.id);
+      }
+      return;
+    }
   }
   card.scrollIntoView({ block: "center" });
   card.focus({ preventScroll: true });
@@ -2205,7 +3049,10 @@ function placeInlineComments(list: HTMLElement): void {
       ...diff.querySelectorAll<HTMLElement>("[data-review-side]"),
     ].find(
       (element) =>
-        element.dataset.reviewFile === comment.anchor.file &&
+        fileMatchesAnchor(
+          element.closest<HTMLElement>(".d2h-file-wrapper")!,
+          comment.anchor.file,
+        ) &&
         element.dataset.reviewSide === comment.anchor.side &&
         element.dataset.reviewLine === String(comment.anchor.end),
     );
@@ -2279,6 +3126,307 @@ function acknowledge(nextComments: ReviewComment[]): void {
   persist();
 }
 
+function sectionFileNames(section: string): { old?: string; new?: string } {
+  try {
+    const file = parse(section)[0];
+    return { old: file?.oldName, new: file?.newName };
+  } catch {
+    return {};
+  }
+}
+
+function hunkStart(line: string): { old: number; next: number } | undefined {
+  const match = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)?/);
+  if (!match) return undefined;
+  return { old: Number(match[1]), next: Number(match[2]) };
+}
+
+function contextRows(oldLines: string[], newLines: string[]): string[] {
+  const rows: string[] = [];
+  const count = Math.max(oldLines.length, newLines.length);
+  for (let index = 0; index < count; index += 1) {
+    const oldLine = oldLines[index];
+    const newLine = newLines[index];
+    if (oldLine !== undefined && newLine !== undefined) {
+      if (oldLine === newLine) rows.push(` ${oldLine}`);
+      else rows.push(`-${oldLine}`, `+${newLine}`);
+    } else if (oldLine !== undefined) rows.push(`-${oldLine}`);
+    else if (newLine !== undefined) rows.push(`+${newLine}`);
+  }
+  return rows;
+}
+
+/**
+ * Insert only the source rows returned for one requested range. Keeping these
+ * as a separate hunk preserves other hidden gaps and previously loaded ranges
+ * in the same file.
+ */
+function mergeContextRows(
+  basePatch: string,
+  fileName: string,
+  range: {
+    oldStart: number;
+    oldEnd: number;
+    newStart: number;
+    newEnd: number;
+  },
+  oldLines: string[],
+  newLines: string[],
+): string {
+  const filePath = normalizeFilePath(fileName);
+  const sectionPattern = /(?=^diff --git )/m;
+  const sections = basePatch.split(sectionPattern);
+  let merged = false;
+  const result = sections.map((section) => {
+    if (merged) return section;
+    const names = sectionFileNames(section);
+    if (
+      ![names.old, names.new]
+        .filter((name): name is string => !!name)
+        .some((name) => normalizeFilePath(name) === filePath)
+    )
+      return section;
+
+    const lines = section.split("\n");
+    const hunkLines = lines
+      .map((line, index) => ({ line, index, start: hunkStart(line) }))
+      .filter(
+        (
+          entry,
+        ): entry is {
+          line: string;
+          index: number;
+          start: { old: number; next: number };
+        } => entry.start !== undefined,
+      );
+    let parsedFile: ReturnType<typeof parse>[number] | undefined;
+    try {
+      parsedFile = parse(section)[0];
+    } catch {
+      parsedFile = undefined;
+    }
+    if (!parsedFile) return section;
+
+    const existingOld = new Map<number, string>();
+    const existingNew = new Map<number, string>();
+    for (const block of parsedFile.blocks) {
+      for (const line of block.lines) {
+        if (line.oldNumber !== undefined)
+          existingOld.set(line.oldNumber, line.content);
+        if (line.newNumber !== undefined)
+          existingNew.set(line.newNumber, line.content);
+      }
+    }
+    const rowCount = Math.max(oldLines.length, newLines.length);
+    const missing = Array.from(
+      { length: rowCount },
+      (_, index) => index,
+    ).filter(
+      (index) =>
+        (oldLines[index] !== undefined &&
+          !existingOld.has(range.oldStart + index)) ||
+        (newLines[index] !== undefined &&
+          !existingNew.has(range.newStart + index)),
+    );
+    if (!missing.length) {
+      merged = true;
+      return section;
+    }
+
+    const groups: Array<{ start: number; end: number }> = [];
+    for (const index of missing) {
+      const previous = groups.at(-1);
+      if (previous && previous.end + 1 === index) previous.end = index;
+      else groups.push({ start: index, end: index });
+    }
+    const insertions = groups
+      .map((group) => {
+        const oldValues = oldLines.slice(group.start, group.end + 1);
+        const newValues = newLines.slice(group.start, group.end + 1);
+        const rows: string[] = [];
+        for (
+          let offset = 0;
+          offset < oldValues.length || offset < newValues.length;
+          offset += 1
+        ) {
+          const absolute = group.start + offset;
+          const oldLine = oldValues[offset];
+          const newLine = newValues[offset];
+          const oldMissing =
+            oldLine !== undefined &&
+            !existingOld.has(range.oldStart + absolute);
+          const newMissing =
+            newLine !== undefined &&
+            !existingNew.has(range.newStart + absolute);
+          if (oldMissing && newMissing) {
+            if (oldLine === newLine) rows.push(` ${oldLine}`);
+            else rows.push(`-${oldLine}`, `+${newLine}`);
+          } else if (oldMissing) rows.push(`-${oldLine}`);
+          else if (newMissing) rows.push(`+${newLine}`);
+        }
+        if (!rows.length) return undefined;
+        const oldMissingCount = oldValues.filter(
+          (_, offset) =>
+            !existingOld.has(range.oldStart + group.start + offset),
+        ).length;
+        const newMissingCount = newValues.filter(
+          (_, offset) =>
+            !existingNew.has(range.newStart + group.start + offset),
+        ).length;
+        const oldStart = oldMissingCount ? range.oldStart + group.start : 0;
+        const newStart = newMissingCount ? range.newStart + group.start : 0;
+        const hunk = [
+          `@@ -${oldMissingCount ? `${oldStart},${oldMissingCount}` : "0,0"} +${newMissingCount ? `${newStart},${newMissingCount}` : "0,0"} @@`,
+          ...rows,
+        ];
+        const insertion =
+          hunkLines.find(
+            ({ start }) =>
+              start.old > (oldStart || range.oldStart) ||
+              start.next > (newStart || range.newStart),
+          )?.index ?? lines.length;
+        return { insertion, hunk };
+      })
+      .filter(
+        (value): value is { insertion: number; hunk: string[] } =>
+          value !== undefined,
+      );
+    for (const { insertion, hunk } of [...insertions].sort(
+      (left, right) => right.insertion - left.insertion,
+    ))
+      lines.splice(insertion, 0, ...hunk);
+    merged = true;
+    return lines.join("\n");
+  });
+  return merged ? result.join("") : basePatch;
+}
+
+/** Replace one file in the saved multi-file patch with a bounded response. */
+function mergeExpandedPatch(
+  basePatch: string,
+  expandedPatch: string,
+  fileName: string,
+): string {
+  if (!expandedPatch.trim()) return basePatch;
+  const sections = expandedPatch.split(/(?=^diff --git )/m);
+  const expandedSection = sections.find((section) => {
+    const names = sectionFileNames(section);
+    return [names.old, names.new]
+      .filter((name): name is string => !!name)
+      .some((name) => normalizeFilePath(name) === normalizeFilePath(fileName));
+  });
+  if (!expandedSection) return basePatch;
+  const baseSections = basePatch.split(/(?=^diff --git )/m);
+  let replaced = false;
+  const merged = baseSections.map((section) => {
+    if (replaced) return section;
+    const names = sectionFileNames(section);
+    if (
+      [names.old, names.new]
+        .filter((name): name is string => !!name)
+        .some((name) => normalizeFilePath(name) === normalizeFilePath(fileName))
+    ) {
+      replaced = true;
+      return expandedSection;
+    }
+    return section;
+  });
+  return replaced ? merged.join("") : basePatch;
+}
+
+function onContextExpanded(message: ContextExpandedMessage): void {
+  const id =
+    typeof message.regionId === "string" && message.regionId
+      ? message.regionId
+      : pendingContextExpansion?.id;
+  if (
+    !id ||
+    typeof message.file !== "string" ||
+    (!message.patch &&
+      (!Array.isArray(message.oldLines) || !Array.isArray(message.newLines)))
+  )
+    return;
+  const hasSourceRows =
+    Array.isArray(message.oldLines) &&
+    Array.isArray(message.newLines) &&
+    Number.isSafeInteger(message.oldStart) &&
+    Number.isSafeInteger(message.oldEnd) &&
+    Number.isSafeInteger(message.newStart) &&
+    Number.isSafeInteger(message.newEnd);
+  review.patch = hasSourceRows
+    ? mergeContextRows(
+        review.patch ?? "",
+        message.file,
+        {
+          oldStart: message.oldStart!,
+          oldEnd: message.oldEnd!,
+          newStart: message.newStart!,
+          newEnd: message.newEnd!,
+        },
+        message.oldLines!,
+        message.newLines!,
+      )
+    : mergeExpandedPatch(review.patch ?? "", message.patch ?? "", message.file);
+  expandedContextBlocks.add(id);
+  contextExpansionErrors.delete(id);
+  if (
+    (message.endOfFile ||
+      (message.direction === "below" &&
+        Array.isArray(message.oldLines) &&
+        Array.isArray(message.newLines) &&
+        message.oldLines.length < CONTEXT_EXPANSION_LINES &&
+        message.newLines.length < CONTEXT_EXPANSION_LINES)) &&
+    typeof message.file === "string" &&
+    message.direction
+  )
+    exhaustedContextRegions.add(
+      contextRegionKey(message.file, message.direction),
+    );
+  pendingContextExpansion = undefined;
+  review.expandedRanges = [
+    ...(review.expandedRanges ?? []).filter((range) => range.id !== id),
+    ...(message.direction &&
+    Number.isSafeInteger(message.oldStart) &&
+    Number.isSafeInteger(message.oldEnd) &&
+    Number.isSafeInteger(message.newStart) &&
+    Number.isSafeInteger(message.newEnd)
+      ? [
+          {
+            id,
+            file: message.file,
+            direction: message.direction,
+            oldStart: message.oldStart!,
+            oldEnd: message.oldEnd!,
+            newStart: message.newStart!,
+            newEnd: message.newEnd!,
+          },
+        ]
+      : []),
+  ];
+  renderDiff();
+  updateModeButtons();
+  if (pendingCommentNavigation) {
+    const navigation = pendingCommentNavigation;
+    pendingCommentNavigation = undefined;
+    queueMicrotask(() => jumpToComment(navigation.id));
+  }
+}
+
+function onContextError(message: ContextErrorMessage): void {
+  const id =
+    typeof message.regionId === "string" && message.regionId
+      ? message.regionId
+      : pendingContextExpansion?.id;
+  if (!id) return;
+  pendingContextExpansion = undefined;
+  pendingCommentNavigation = undefined;
+  contextExpansionErrors.set(
+    id,
+    message.message?.trim() || "Could not load more context. Try again.",
+  );
+  renderDiff();
+}
+
 function onState(message: ReviewStateMessage): void {
   const previousPatch = review.patch ?? "";
   const completedExpansion = pendingContextExpansion;
@@ -2308,6 +3456,7 @@ function onState(message: ReviewStateMessage): void {
     !isLegacyMigration &&
     previousScope !== undefined &&
     previousScope !== nextScope;
+  const hasSnapshotPatch = typeof message.snapshot?.patch === "string";
   if (reviewChanged) {
     // Keep draft text and pending operations for crash recovery, but never
     // display an anchor from a different repository/comparison in this diff.
@@ -2315,16 +3464,33 @@ function onState(message: ReviewStateMessage): void {
     activeComposerKey = undefined;
     editingComment = undefined;
     expandedContextBlocks.clear();
+    localExpansionProgress.clear();
+    exhaustedContextRegions.clear();
+    contextExpansionErrors.clear();
+    pendingContextExpansion = undefined;
+  } else if (hasSnapshotPatch) {
+    // A snapshot is authoritative. Rebuild the visible patch from its base
+    // patch and source rows below so a refresh cannot retain rows from the
+    // previous review or from an earlier version of the snapshot.
+    expandedContextBlocks.clear();
+    localExpansionProgress.clear();
+    exhaustedContextRegions.clear();
+    contextExpansionErrors.clear();
     pendingContextExpansion = undefined;
   } else if (completedExpansion) {
     expandedContextBlocks.add(completedExpansion.id);
     pendingContextExpansion = undefined;
   } else if ((message.patch ?? "") !== previousPatch) {
     expandedContextBlocks.clear();
+    localExpansionProgress.clear();
   }
+  const authoritativePatch = hasSnapshotPatch
+    ? message.snapshot!.patch!
+    : (message.patch ?? "");
   review = {
     type: "state",
     repo: message.repo,
+    directory: message.directory,
     command: message.command,
     reviewId: message.reviewId,
     reviewName: message.reviewName,
@@ -2334,9 +3500,45 @@ function onState(message: ReviewStateMessage): void {
     contextLines: message.contextLines,
     canExpandContext: message.canExpandContext,
     customCommand: message.customCommand,
-    patch: message.patch ?? "",
+    patch: authoritativePatch,
     comments: Array.isArray(message.comments) ? message.comments : [],
+    expandedRanges: message.expandedRanges ?? message.snapshot?.expandedRanges,
   };
+  if (hasSnapshotPatch) {
+    const savedRanges = message.snapshot?.sourceRanges ?? [];
+    const rangeMetadata =
+      message.expandedRanges ?? message.snapshot?.expandedRanges ?? [];
+    for (const source of savedRanges) {
+      const range = rangeMetadata.find(
+        (candidate) => candidate.id === source.id,
+      );
+      if (
+        !range ||
+        !Array.isArray(source.oldLines) ||
+        !Array.isArray(source.newLines) ||
+        !Number.isSafeInteger(source.oldStart) ||
+        !Number.isSafeInteger(source.newStart)
+      )
+        continue;
+      review.patch = mergeContextRows(
+        review.patch ?? "",
+        source.file,
+        range,
+        source.oldLines,
+        source.newLines,
+      );
+      expandedContextBlocks.add(source.id);
+      if (
+        range.direction === "below" &&
+        (source.endOfFile ??
+          // Older snapshots used 20-line increments.
+          (source.oldLines.length < 20 && source.newLines.length < 20))
+      )
+        exhaustedContextRegions.add(
+          contextRegionKey(source.file, range.direction),
+        );
+    }
+  }
   if (!hasAuthoritativeState) {
     if (message.viewMode === "inline" || message.viewMode === "split")
       mode = message.viewMode;
@@ -2347,7 +3549,11 @@ function onState(message: ReviewStateMessage): void {
     customCommandInput.value = review.customCommand ?? "";
   updatePresetFromCommand();
   const location = review.repo
-    ? `Repository: ${review.repo}`
+    ? `Repository: ${review.repo}${
+        review.directory && review.directory !== review.repo
+          ? ` · Directory: ${review.directory}`
+          : ""
+      }`
     : "Choose a repository to review";
   showInfo(
     review.reviewName
@@ -2361,6 +3567,11 @@ function onState(message: ReviewStateMessage): void {
   renderReviewManager();
   renderDiff();
   updateModeButtons();
+  if (pendingCommentNavigation) {
+    const navigation = pendingCommentNavigation;
+    pendingCommentNavigation = undefined;
+    queueMicrotask(() => jumpToComment(navigation.id));
+  }
 }
 
 function onReviewsDeleted(message: { repo?: string; ids?: string[] }): void {
@@ -2389,11 +3600,15 @@ function onReviewsDeleted(message: { repo?: string; ids?: string[] }): void {
 window.addEventListener("message", (event) => {
   const message = event.data as
     | ReviewStateMessage
+    | ContextExpandedMessage
+    | ContextErrorMessage
     | { type: "error"; message?: string }
     | { type: "reviewsDeleted"; repo?: string; ids?: string[] }
     | undefined;
   if (!message || typeof message.type !== "string") return;
   if (message.type === "state") onState(message);
+  else if (message.type === "contextExpanded") onContextExpanded(message);
+  else if (message.type === "contextError") onContextError(message);
   else if (message.type === "reviewsDeleted") onReviewsDeleted(message);
   else if (message.type === "error") {
     for (const [key, operation] of pending) {

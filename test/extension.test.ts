@@ -5,9 +5,15 @@ import {
   readFile,
   realpath,
   rm,
+  symlink,
   writeFile,
 } from "node:fs/promises";
 import Module from "node:module";
+import {
+  execFile as nodeExecFile,
+  execFileSync,
+  spawnSync,
+} from "node:child_process";
 import * as path from "node:path";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
@@ -37,18 +43,26 @@ class Emitter<T> {
 class FakeUri {
   readonly scheme: string;
   readonly fsPath: string;
+  readonly authority: string;
 
-  private constructor(fsPath: string, scheme = "file") {
+  private constructor(fsPath: string, scheme = "file", authority = "") {
     this.fsPath = fsPath;
     this.scheme = scheme;
+    this.authority = authority;
   }
 
   static file(fsPath: string): FakeUri {
     return new FakeUri(fsPath);
   }
 
+  static remote(fsPath: string, authority: string): FakeUri {
+    return new FakeUri(fsPath, "vscode-remote", authority);
+  }
+
   toString(): string {
-    return `${this.scheme}:${this.fsPath}`;
+    return this.authority
+      ? `${this.scheme}://${this.authority}${this.fsPath}`
+      : `${this.scheme}:${this.fsPath}`;
   }
 }
 
@@ -147,10 +161,11 @@ type Host = {
   workspaceState: Map<string, unknown>;
   inputValues: string[];
   quickPickCalls: string[][];
+  execEnvs: Array<NodeJS.ProcessEnv | undefined>;
   execFile(
     file: string,
     args: string[],
-    options: { cwd?: string },
+    options: { cwd?: string; env?: NodeJS.ProcessEnv },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ): void;
 };
@@ -169,6 +184,7 @@ function makeHost(repo: string, storage: string): Host {
   const workspaceState = new Map<string, unknown>();
   const inputValues: string[] = [];
   const quickPickCalls: string[][] = [];
+  const execEnvs: Array<NodeJS.ProcessEnv | undefined> = [];
   const configuration = {
     get<T>(_key: string, defaultValue?: T): T | undefined {
       return defaultValue;
@@ -178,12 +194,15 @@ function makeHost(repo: string, storage: string): Host {
   const execFile = (
     file: string,
     args: string[],
-    options: { cwd?: string },
+    options: { cwd?: string; env?: NodeJS.ProcessEnv },
     callback: (error: Error | null, stdout: string, stderr: string) => void,
   ) => {
     execCalls.push({ file, args: [...args], cwd: options.cwd });
+    execEnvs.push(options.env);
     if (args[0] === "root") {
       callback(null, `${options.cwd ?? repo}\n`, "");
+    } else if (args[0] === "cat") {
+      callback(null, "one\ntwo\nthree\n", "");
     } else {
       callback(
         null,
@@ -266,7 +285,9 @@ function makeHost(repo: string, storage: string): Host {
     Uri: {
       file: FakeUri.file,
       joinPath: (base: FakeUri, ...parts: string[]) =>
-        FakeUri.file(path.join(base.fsPath, ...parts)),
+        base.scheme === "file"
+          ? FakeUri.file(path.join(base.fsPath, ...parts))
+          : FakeUri.remote(path.join(base.fsPath, ...parts), base.authority),
     },
     Position: FakePosition,
     Selection: FakeSelection,
@@ -323,8 +344,25 @@ function makeHost(repo: string, storage: string): Host {
     workspaceState,
     inputValues,
     quickPickCalls,
+    execEnvs,
     execFile,
   };
+}
+
+function makeRealHost(repo: string, storage: string): Host {
+  const host = makeHost(repo, storage);
+  host.execFile = (file, args, options, callback) => {
+    host.execCalls.push({ file, args: [...args], cwd: options.cwd });
+    host.execEnvs.push(options.env);
+    nodeExecFile(
+      file,
+      args,
+      options as Parameters<typeof nodeExecFile>[2],
+      (error, stdout, stderr) =>
+        callback(error, String(stdout ?? ""), String(stderr ?? "")),
+    );
+  };
+  return host;
 }
 
 function makeContext(host: Host, repo: string, storage: string) {
@@ -362,16 +400,18 @@ async function waitFor(predicate: () => boolean): Promise<void> {
 
 test("activation persists custom review comments, runs custom diff arguments explicitly, and opens file lines", async (t) => {
   const root = await mkdtemp(path.join(tmpdir(), "gm-sapling-extension-"));
-  const repo = path.join(root, "repo");
+  const repoDirectory = path.join(root, "repo");
   const storage = path.join(root, "storage");
   await writeFile(path.join(root, "placeholder"), "fixture");
-  await mkdir(path.join(repo, "src"), { recursive: true });
+  await mkdir(path.join(repoDirectory, "src"), { recursive: true });
+  const repo = await realpath(repoDirectory);
   const file = path.join(repo, "src", "app.ts");
   await writeFile(file, "one\ntwo\nthree\n");
 
   const host = makeHost(repo, storage);
-  const otherRepo = path.join(root, "second-repo");
-  await mkdir(otherRepo);
+  const otherRepoDirectory = path.join(root, "second-repo");
+  await mkdir(otherRepoDirectory);
+  const otherRepo = await realpath(otherRepoDirectory);
   (host.vscode.workspace as any).workspaceFolders.push({
     uri: FakeUri.file(otherRepo),
   });
@@ -401,11 +441,15 @@ test("activation persists custom review comments, runs custom diff arguments exp
         "--color",
         "never",
         "diff",
-        "--git",
         "--rev",
         ".",
+        "--git",
+        "--no-binary",
+        "--nodate",
+        "--color",
+        "never",
         "--unified",
-        "1000000",
+        "4",
       ],
     );
     assert.equal(
@@ -422,32 +466,33 @@ test("activation persists custom review comments, runs custom diff arguments exp
       initialState?.reviews?.[0]?.updatedAt;
     const diffCalls = () =>
       host.execCalls.filter((call) => call.args.includes("diff"));
-    const diffCallsBeforeExpansion = diffCalls().length;
+    const expandedMessagesBefore = panel.webview.messages.filter(
+      (message: any) => message.type === "contextExpanded",
+    ).length;
     panel.webview.emit({
       type: "expandContext",
       file: "src/app.ts",
-      direction: "above",
-      contextLines: 1000000,
+      direction: "below",
+      oldStart: 4,
+      oldEnd: 4,
+      newStart: 4,
+      newEnd: 4,
     });
-    await waitFor(() => diffCalls().length > diffCallsBeforeExpansion);
-    assert.deepEqual(diffCalls().at(-1), {
-      file: "sl",
-      args: [
-        "--color",
-        "never",
-        "diff",
-        "--git",
-        "--rev",
-        ".",
-        "--unified",
-        "1000000",
-      ],
-      cwd: repo,
-    });
+    await waitFor(
+      () =>
+        panel.webview.messages.filter(
+          (message: any) => message.type === "contextExpanded",
+        ).length > expandedMessagesBefore,
+    );
+    const expandedMessage = panel.webview.messages
+      .filter((message: any) => message.type === "contextExpanded")
+      .at(-1) as any;
+    assert.deepEqual(expandedMessage.oldLines, []);
+    assert.deepEqual(expandedMessage.newLines, []);
     const expandedState = panel.webview.messages
       .filter((message: any) => message.type === "state")
       .at(-1) as any;
-    assert.equal(expandedState.contextLines, 1000000);
+    assert.equal(expandedState.contextLines, 4);
     assert.equal(
       expandedState.reviews[0].updatedAt,
       reviewUpdatedAtBeforeExpansion,
@@ -458,18 +503,21 @@ test("activation persists custom review comments, runs custom diff arguments exp
     await custom?.();
     await waitFor(() => host.panels.length === 1);
 
-    t.diagnostic(`exec calls: ${JSON.stringify(host.execCalls)}`);
     assert.deepEqual(diffCalls().at(-1)?.args, [
       "--color",
       "never",
       "diff",
-      "--git",
       "--rev",
       ".^",
       "--include",
       "src/app.ts",
+      "--git",
+      "--no-binary",
+      "--nodate",
+      "--color",
+      "never",
       "--unified",
-      "1000000",
+      "4",
     ]);
     assert.equal(
       host.workspaceState.get("lastReview") != null,
@@ -491,11 +539,15 @@ test("activation persists custom review comments, runs custom diff arguments exp
         "--color",
         "never",
         "diff",
-        "--git",
         "--rev",
         ".^",
+        "--git",
+        "--no-binary",
+        "--nodate",
+        "--color",
+        "never",
         "--unified",
-        "1000000",
+        "4",
       ],
       cwd: repo,
     });
@@ -512,13 +564,17 @@ test("activation persists custom review comments, runs custom diff arguments exp
         "--color",
         "never",
         "diff",
-        "--git",
         "--rev",
         ".^",
         "--include",
         "src/app.ts",
+        "--git",
+        "--no-binary",
+        "--nodate",
+        "--color",
+        "never",
         "--unified",
-        "1000000",
+        "4",
       ],
       cwd: repo,
     });
@@ -868,8 +924,553 @@ test("activation persists custom review comments, runs custom diff arguments exp
   } finally {
     moduleLoader._load = originalLoad;
     await rm(root, { recursive: true, force: true });
-    t.diagnostic(
-      "The test uses a temporary repo and restores the module loader after activation.",
+  }
+});
+
+test(
+  "real Sapling host expands bounded ranges, resolves historical sides, and restores comment context",
+  {
+    skip: spawnSync("sl", ["--version"], { stdio: "ignore" }).status !== 0,
+  },
+  async () => {
+    const root = await mkdtemp(path.join(tmpdir(), "gm-sapling-real-host-"));
+    const repoDirectory = path.join(root, "repo");
+    const storage = path.join(root, "storage");
+    await mkdir(path.join(repoDirectory, "src"), { recursive: true });
+    const repo = await realpath(repoDirectory);
+    const oldFile = path.join(repo, "src", "old.ts");
+    const newFile = path.join(repo, "src", "new.ts");
+    const runSl = (args: string[], cwd = repo): string =>
+      execFileSync("sl", args, {
+        cwd,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          HGENCODING: "UTF-8",
+          SL_ENCODING: "UTF-8",
+        },
+      });
+    const commit = (message: string) =>
+      runSl(["commit", "-m", message, "-u", "Review Test <test@example.com>"]);
+
+    runSl(["init"]);
+    const initial = Array.from(
+      { length: 130 },
+      (_, index) => `line ${index + 1}`,
     );
+    await writeFile(oldFile, `${initial.join("\n")}\n`);
+    runSl(["add", "src/old.ts"]);
+    commit("initial");
+    const rev1 = runSl(["log", "-r", ".", "-T", "{node}"]).trim();
+
+    initial[34] = "line 35 in second revision";
+    await writeFile(oldFile, `${initial.join("\n")}\n`);
+    commit("second revision");
+    const rev2 = runSl(["log", "-r", ".", "-T", "{node}"]).trim();
+
+    runSl(["rename", "src/old.ts", "src/new.ts"]);
+    initial[35] = "line 36 after rename";
+    await writeFile(newFile, `${initial.join("\n")}\n`);
+    commit("rename and edit");
+    const rev3 = runSl(["log", "-r", ".", "-T", "{node}"]).trim();
+
+    initial[9] = "line 10 working copy";
+    initial[59] = "line 60 working copy";
+    initial[109] = "line 110 working copy";
+    await writeFile(newFile, `${initial.join("\n")}\n`);
+
+    const host = makeRealHost(repo, storage);
+    const moduleLoader = Module as unknown as NodeModuleLoader;
+    const originalLoad = moduleLoader._load;
+    moduleLoader._load = function (request, parent, isMain) {
+      if (request === "vscode") return host.vscode;
+      if (request === "node:child_process") return { execFile: host.execFile };
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    const extensionPath = require.resolve("../src/extension");
+    delete require.cache[extensionPath];
+
+    try {
+      const extension =
+        require("../src/extension") as typeof import("../src/extension");
+      extension.activate(makeContext(host, repo, storage) as never);
+      await host.commands.get("gmSapling.review")?.();
+      await waitFor(() => host.panels.length === 1);
+      let panel = host.panels[0];
+      const state = () =>
+        panel.webview.messages
+          .filter((message: any) => message.type === "state")
+          .at(-1) as any;
+      await waitFor(() => !!state()?.patch);
+      assert.equal(state().contextLines, 4);
+      assert.ok(state().patch.includes("line 10 working copy"));
+      assert.ok(!state().patch.includes("line 30\n"));
+      assert.equal(state().snapshot.files[0].newPath, "src/new.ts");
+      assert.equal(
+        host.execCalls
+          .find((call) => call.args.includes("diff"))
+          ?.args.includes("4"),
+        true,
+      );
+
+      const expand = async (
+        id: string,
+        direction: "above" | "between" | "below",
+        start: number,
+        end: number,
+        file = "src/new.ts",
+      ) => {
+        const before = panel.webview.messages.filter(
+          (message: any) => message.type === "contextExpanded",
+        ).length;
+        panel.webview.emit({
+          type: "expandContext",
+          file,
+          direction,
+          regionId: id,
+          oldStart: start,
+          oldEnd: end,
+          newStart: start,
+          newEnd: end,
+        });
+        await waitFor(
+          () =>
+            panel.webview.messages.filter(
+              (message: any) => message.type === "contextExpanded",
+            ).length > before,
+        );
+        return panel.webview.messages
+          .filter((message: any) => message.type === "contextExpanded")
+          .at(-1) as any;
+      };
+
+      const above = await expand("above", "above", 1, 5);
+      const between = await expand("between", "between", 20, 49);
+      const betweenEarlier = await expand("between", "between", 15, 29);
+      const betweenAgain = await expand("between", "between", 20, 49);
+      const below = await expand("below", "below", 115, 140);
+      assert.ok(above.oldLines.length <= 30);
+      assert.equal(between.oldLines.length, 30);
+      assert.equal(betweenEarlier.oldLines.length, 15);
+      assert.equal(betweenAgain.oldLines.length, 30);
+      assert.equal(below.oldLines.at(-1), "line 130");
+      assert.equal(
+        below.oldEnd,
+        130,
+        "tail expansion records its EOF boundary",
+      );
+      assert.ok(
+        host.execCalls.some(
+          (call) => call.args[0] === "cat" && call.args.includes("src/new.ts"),
+        ),
+        "resolved ranges use source reads for the renamed file",
+      );
+
+      panel.webview.emit({
+        type: "saveComment",
+        body: "Review this stable context.",
+        anchor: {
+          file: "src/new.ts",
+          side: "new",
+          start: 35,
+          end: 35,
+          text: ["line 35 in second revision"],
+        },
+      });
+      await waitFor(() => state().comments.length === 1);
+      assert.equal(state().comments[0].status, "current");
+      assert.ok(
+        state().snapshot.sourceRanges.some(
+          (range: { id: string }) => range.id === "between",
+        ),
+        "expanded context is persisted alongside the comment",
+      );
+
+      panel.webview.emit({ type: "refresh", choice: "uncommitted" });
+      await waitFor(() =>
+        state()?.snapshot?.sourceRanges?.some((range: { id: string }) =>
+          range.id.startsWith("comment:"),
+        ),
+      );
+      assert.equal(
+        state().comments[0].status,
+        "current",
+        "refresh restores the unchanged comment from its source range",
+      );
+
+      const restoreSerializer = host.serializers.get("gmSapling.review");
+      assert.ok(restoreSerializer);
+      panel.dispose();
+      const restoredBeforeHistory = makePanel();
+      panel = restoredBeforeHistory;
+      await restoreSerializer?.deserializeWebviewPanel(
+        restoredBeforeHistory,
+        undefined,
+      );
+      await waitFor(() =>
+        state()?.snapshot?.sourceRanges?.some((range: { id: string }) =>
+          range.id.startsWith("comment:"),
+        ),
+      );
+      assert.equal(
+        state().comments[0].status,
+        "current",
+        "serializer restoration preserves the expanded comment context",
+      );
+
+      panel.webview.emit({
+        type: "refresh",
+        choice: "custom",
+        command: `--rev ${rev1} --rev ${rev2}`,
+      });
+      await waitFor(() => state().command.includes(rev1));
+      assert.ok(state().patch.includes("line 35 in second revision"));
+
+      const historical = await expand(
+        "historical",
+        "between",
+        30,
+        30,
+        "src/old.ts",
+      );
+      assert.deepEqual(historical.oldLines, ["line 30"]);
+      assert.deepEqual(historical.newLines, ["line 30"]);
+      assert.ok(
+        host.execCalls.some(
+          (call) =>
+            call.args[0] === "cat" &&
+            call.args.includes(rev1) &&
+            call.args.includes("src/old.ts"),
+        ),
+      );
+      assert.ok(
+        host.execCalls.some(
+          (call) =>
+            call.args[0] === "cat" &&
+            call.args.includes(rev2) &&
+            call.args.includes("src/old.ts"),
+        ),
+      );
+
+      panel.webview.emit({
+        type: "refresh",
+        choice: "custom",
+        command: `--rev ${rev2} --rev ${rev3}`,
+      });
+      await waitFor(() => state().command.includes(rev3));
+      const rename = state().snapshot.files.find(
+        (file: { oldPath?: string; newPath?: string }) =>
+          file.oldPath === "src/old.ts" || file.newPath === "src/new.ts",
+      );
+      assert.equal(rename?.oldPath, "src/old.ts");
+      assert.equal(rename?.newPath, "src/new.ts");
+
+      const renameContext = await expand(
+        "rename-context",
+        "between",
+        25,
+        25,
+        "src/new.ts",
+      );
+      assert.deepEqual(renameContext.oldLines, ["line 25"]);
+      assert.deepEqual(renameContext.newLines, ["line 25"]);
+      assert.ok(
+        host.execCalls.some(
+          (call) =>
+            call.args[0] === "cat" &&
+            call.args.includes(rev2) &&
+            call.args.includes("src/old.ts"),
+        ),
+        "rename expansion reads the old path at the old revision",
+      );
+      assert.ok(
+        host.execCalls.some(
+          (call) =>
+            call.args[0] === "cat" &&
+            call.args.includes(rev3) &&
+            call.args.includes("src/new.ts"),
+        ),
+        "rename expansion reads the new path at the new revision",
+      );
+
+      panel.dispose();
+      const serializer = host.serializers.get("gmSapling.review");
+      assert.ok(serializer);
+      const restored = makePanel();
+      await serializer?.deserializeWebviewPanel(restored, undefined);
+      await waitFor(() =>
+        restored.webview.messages.some(
+          (message: any) =>
+            message.type === "state" && message.comments?.length,
+        ),
+      );
+      const restoredState = restored.webview.messages
+        .filter((message: any) => message.type === "state")
+        .at(-1) as any;
+      assert.equal(restoredState.comments[0].status, "current");
+      restored.dispose();
+    } finally {
+      moduleLoader._load = originalLoad;
+      delete require.cache[extensionPath];
+      await rm(root, { recursive: true, force: true });
+    }
+  },
+);
+
+test("malformed remembered reviews fall back without replacing the file", async () => {
+  const root = await mkdtemp(
+    path.join(tmpdir(), "gm-sapling-malformed-review-"),
+  );
+  const repoDirectory = path.join(root, "repo");
+  const storage = path.join(root, "storage");
+  await mkdir(repoDirectory, { recursive: true });
+  const repo = await realpath(repoDirectory);
+  const id = "corrupt-review";
+  const malformedPath = path.join(
+    storage,
+    `${createHash("sha256").update(`review-v2\0${repo}\0${id}`).digest("hex")}.json`,
+  );
+  const malformed = JSON.stringify({
+    version: 2,
+    id,
+    repo,
+    comments: "not an array",
+  });
+  await mkdir(storage, { recursive: true });
+  await writeFile(malformedPath, malformed);
+
+  const host = makeHost(repo, storage);
+  host.workspaceState.set("lastReview", { repo, id });
+  host.workspaceState.set("lastReviewByRepo", { [repo]: id });
+  const moduleLoader = Module as unknown as NodeModuleLoader;
+  const originalLoad = moduleLoader._load;
+  const extensionPath = require.resolve("../src/extension");
+  delete require.cache[extensionPath];
+  moduleLoader._load = function (request, parent, isMain) {
+    if (request === "vscode") return host.vscode;
+    if (request === "node:child_process") return { execFile: host.execFile };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    const extension =
+      require("../src/extension") as typeof import("../src/extension");
+    extension.activate(makeContext(host, repo, storage) as never);
+    await host.commands.get("gmSapling.review")?.();
+    await waitFor(() => host.panels.length === 1);
+    await waitFor(() =>
+      host.panels[0].webview.messages.some(
+        (message: any) =>
+          message.type === "state" && message.reviewId === "default",
+      ),
+    );
+    assert.equal(await readFile(malformedPath, "utf8"), malformed);
+  } finally {
+    moduleLoader._load = originalLoad;
+    delete require.cache[extensionPath];
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("host preserves remote workspace URIs and platform command settings", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "gm-sapling-platform-host-"));
+  const workspaceTarget = path.join(root, "workspace-target");
+  const workspaceLink = path.join(root, "workspace-link");
+  const repoDirectory = path.join(workspaceTarget, "nested", "repo");
+  const storage = path.join(root, "storage");
+  const authority = "ssh-remote+review";
+  await mkdir(path.join(repoDirectory, "src", ".sl-placeholder"), {
+    recursive: true,
+  });
+  await mkdir(path.join(repoDirectory, ".sl"));
+  const source = path.join(repoDirectory, "src", "app.ts");
+  await writeFile(source, "one\ntwo\nthree\n");
+  await symlink(workspaceTarget, workspaceLink, "dir");
+  const canonicalWorkspaceTarget = await realpath(workspaceTarget);
+  const repo = await realpath(repoDirectory);
+
+  const host = makeHost(repo, storage);
+  (host.vscode.workspace as any).workspaceFolders = [
+    { uri: FakeUri.remote(workspaceLink, authority) },
+  ];
+  const defaultExec = host.execFile;
+  host.execFile = (file, args, options, callback) => {
+    if (args[0] === "root" && options.cwd === canonicalWorkspaceTarget) {
+      host.execCalls.push({ file, args: [...args], cwd: options.cwd });
+      host.execEnvs.push(options.env);
+      callback(new Error("workspace parent is not a repository"), "", "");
+      return;
+    }
+    defaultExec(file, args, options, callback);
+  };
+  const moduleLoader = Module as unknown as NodeModuleLoader;
+  const originalLoad = moduleLoader._load;
+  const extensionPath = require.resolve("../src/extension");
+  delete require.cache[extensionPath];
+  moduleLoader._load = function (request, parent, isMain) {
+    if (request === "vscode") return host.vscode;
+    if (request === "node:child_process") return { execFile: host.execFile };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let platformDescriptor: PropertyDescriptor | undefined;
+  try {
+    const extension =
+      require("../src/extension") as typeof import("../src/extension");
+    extension.activate(makeContext(host, repo, storage) as never);
+    await host.commands.get("gmSapling.review")?.();
+    await waitFor(() => host.panels.length === 1);
+    const panel = host.panels[0];
+    const state = () =>
+      panel.webview.messages
+        .filter((message: any) => message.type === "state")
+        .at(-1) as any;
+    await waitFor(() => !!state()?.patch);
+
+    const diffCalls = () =>
+      host.execCalls.filter((call) => call.args.includes("diff"));
+    assert.equal(
+      diffCalls().at(-1)?.cwd,
+      repo,
+      "a repository nested below the workspace uses the repository as cwd",
+    );
+    assert.ok(
+      host.execCalls.every((call) => call.file === "sl"),
+      "an empty commandPath uses the platform default executable",
+    );
+    const environment = host.execEnvs.at(-1);
+    assert.equal(environment?.HGENCODING, "UTF-8");
+    assert.equal(environment?.SL_ENCODING, "UTF-8");
+    assert.equal(environment?.SL_AUTOMATION, "true");
+    assert.equal(
+      environment?.SL_AUTOMATION_EXCEPT,
+      "ghrevset,phrevset,progress,sniff,username",
+    );
+    assert.equal(environment?.EDITOR, undefined);
+    assert.equal(environment?.VISUAL, undefined);
+
+    const sourceUri = FakeUri.remote(source, authority);
+    panel.webview.emit({ type: "open", file: "src/app.ts", line: 2 });
+    await waitFor(() => host.openedDocuments.length === 1);
+    assert.equal(host.openedDocuments[0].uri.scheme, "vscode-remote");
+    assert.equal(host.openedDocuments[0].uri.authority, authority);
+    assert.equal(
+      await realpath(host.openedDocuments[0].uri.fsPath),
+      await realpath(source),
+    );
+
+    let saveOptions: any;
+    (host.vscode.window as any).showSaveDialog = async (options: any) => {
+      saveOptions = options;
+      return FakeUri.remote(
+        path.join(workspaceLink, "nested", "repo", "review.md"),
+        authority,
+      );
+    };
+    panel.webview.emit({
+      type: "manageReviewAction",
+      repo,
+      id: state().reviewId,
+      action: "export",
+    });
+    await waitFor(() => host.shownEditors.length > 1);
+    assert.equal(saveOptions.defaultUri.scheme, "vscode-remote");
+    assert.equal(saveOptions.defaultUri.authority, authority);
+    assert.match(
+      await readFile(
+        path.join(workspaceLink, "nested", "repo", "review.md"),
+        "utf8",
+      ),
+      /# Review comments/,
+    );
+
+    const stateCount = () =>
+      panel.webview.messages.filter((message: any) => message.type === "state")
+        .length;
+    const statesBeforeSave = stateCount();
+    const beforeSave = diffCalls().length;
+    host.savedDocument.fire({ uri: sourceUri });
+    await waitFor(
+      () => diffCalls().length > beforeSave && stateCount() > statesBeforeSave,
+    );
+    assert.equal(
+      diffCalls().at(-1)?.cwd,
+      repo,
+      "a non-file save still refreshes the repository preset in its cwd",
+    );
+
+    platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+    assert.equal(platformDescriptor?.configurable, true);
+    try {
+      Object.defineProperty(process, "platform", { value: "win32" });
+      const beforeWindowsRefresh = host.execCalls.length;
+      const statesBeforeWindowsRefresh = stateCount();
+      panel.webview.emit({ type: "refresh", choice: "uncommitted" });
+      await waitFor(
+        () =>
+          host.execCalls.length > beforeWindowsRefresh &&
+          host.execCalls.some((call) => call.file === "sl.exe") &&
+          stateCount() > statesBeforeWindowsRefresh,
+      );
+    } finally {
+      Object.defineProperty(process, "platform", platformDescriptor);
+    }
+  } finally {
+    moduleLoader._load = originalLoad;
+    delete require.cache[extensionPath];
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("host runs a repository diff from a workspace subdirectory", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "gm-sapling-subdir-host-"));
+  const repo = path.join(root, "repo");
+  const subdirectory = path.join(repo, "src");
+  const storage = path.join(root, "storage");
+  await mkdir(subdirectory, { recursive: true });
+  await writeFile(path.join(subdirectory, "app.ts"), "one\ntwo\nthree\n");
+  const canonicalRepo = await realpath(repo);
+  const canonicalSubdirectory = await realpath(subdirectory);
+
+  const host = makeHost(repo, storage);
+  (host.vscode.workspace as any).workspaceFolders = [
+    { uri: FakeUri.file(subdirectory) },
+  ];
+  const defaultExec = host.execFile;
+  host.execFile = (file, args, options, callback) => {
+    if (args[0] === "root" && options.cwd === canonicalSubdirectory) {
+      host.execCalls.push({ file, args: [...args], cwd: options.cwd });
+      host.execEnvs.push(options.env);
+      callback(null, `${canonicalRepo}\n`, "");
+      return;
+    }
+    defaultExec(file, args, options, callback);
+  };
+  const moduleLoader = Module as unknown as NodeModuleLoader;
+  const originalLoad = moduleLoader._load;
+  const extensionPath = require.resolve("../src/extension");
+  delete require.cache[extensionPath];
+  moduleLoader._load = function (request, parent, isMain) {
+    if (request === "vscode") return host.vscode;
+    if (request === "node:child_process") return { execFile: host.execFile };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  try {
+    const extension =
+      require("../src/extension") as typeof import("../src/extension");
+    extension.activate(makeContext(host, repo, storage) as never);
+    await host.commands.get("gmSapling.review")?.();
+    await waitFor(() => host.panels.length === 1);
+    await waitFor(() =>
+      host.panels[0].webview.messages.some(
+        (message: any) => message.type === "state" && message.patch,
+      ),
+    );
+    assert.equal(
+      host.execCalls.filter((call) => call.args.includes("diff")).at(-1)?.cwd,
+      canonicalSubdirectory,
+    );
+  } finally {
+    moduleLoader._load = originalLoad;
+    delete require.cache[extensionPath];
+    await rm(root, { recursive: true, force: true });
   }
 });

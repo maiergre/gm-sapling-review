@@ -21,7 +21,13 @@ test(
       execFileSync("sl", args, {
         cwd,
         encoding: "utf8",
-        env: { ...process.env, HGPLAIN: "1" },
+        env: {
+          ...process.env,
+          HGENCODING: "UTF-8",
+          SL_ENCODING: "UTF-8",
+          SL_AUTOMATION: "true",
+          SL_AUTOMATION_EXCEPT: "ghrevset,phrevset,progress,sniff,username",
+        },
         stdio: ["ignore", "pipe", "pipe"],
       });
     try {
@@ -51,7 +57,14 @@ test(
       const patch = sl(repo, [
         "--color",
         "never",
-        ...parseCommand(presetCommand("uncommitted")),
+        "diff",
+        "--git",
+        "--no-binary",
+        "--nodate",
+        "--unified",
+        "4",
+        "--rev",
+        ".",
       ]);
       assert.equal(parse(patch)[0].newName, "sample.ts");
       assert.ok(patch.includes("+const value = 2;"));

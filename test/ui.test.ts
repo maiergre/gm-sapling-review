@@ -247,7 +247,34 @@ test("built-in diffs offer expandable context gaps in both layouts", () => {
     ];
     assert.deepEqual(
       controls().map((button) => button.dataset.reviewContextDirection),
-      ["above", "between", "below"],
+      ["above", "between", "between", "below"],
+    );
+    assert.deepEqual(
+      controls().map((button) => button.dataset.reviewContextEdge),
+      ["up", "up", "down", "down"],
+      "separators expose independent edge actions",
+    );
+    for (const button of controls()) {
+      const row = button.closest("tr")!;
+      assert.equal(row.querySelectorAll(":scope > td").length, 2);
+      assert.equal(row.querySelector("td")?.colSpan, 1);
+      assert.equal(button.querySelectorAll("svg").length, 1);
+      assert.equal(button.textContent?.includes("Expand"), false);
+      assert.match(button.getAttribute("aria-label") ?? "", /earlier|later/);
+      assert.equal(button.title, button.getAttribute("aria-label"));
+    }
+    const suppressedHunks = [
+      ...b.w.document.querySelectorAll<HTMLTableRowElement>(
+        ".review-context-expansion-suppressed-hunk",
+      ),
+    ];
+    assert.equal(suppressedHunks.length, 0);
+    assert.equal(
+      b.w.document.querySelectorAll(
+        ".review-context-expansion-row .d2h-code-line",
+      ).length,
+      3,
+      "hunk headers remain in separator rows",
     );
     const inlineRows = [
       ...b.w.document.querySelectorAll<HTMLTableRowElement>(
@@ -271,7 +298,11 @@ test("built-in diffs offer expandable context gaps in both layouts", () => {
       type: "expandContext",
       file,
       direction: "above",
-      contextLines: 1000000,
+      regionId: `${file}:above:1-9:1-9`,
+      oldStart: 1,
+      oldEnd: 9,
+      newStart: 1,
+      newEnd: 9,
     });
     b.state([], { patch: fullExpansionPatch, contextLines: 1000000 });
     assert.equal(
@@ -280,6 +311,12 @@ test("built-in diffs offer expandable context gaps in both layouts", () => {
       ),
       false,
       "the clicked block expands while other blocks stay collapsed",
+    );
+    assert.equal(
+      b.w.document.querySelectorAll(".review-context-expansion-suppressed-hunk")
+        .length,
+      0,
+      "full-context local separators keep the hunk marker visible",
     );
     const comment = {
       id: "expanded-context-comment",
@@ -313,7 +350,7 @@ test("built-in diffs offer expandable context gaps in both layouts", () => {
         (table) =>
           table.querySelectorAll(".review-context-expansion-button").length,
       ),
-      [2, 2],
+      [3, 3],
       "split panes keep remaining controls aligned",
     );
     b.state([], {
@@ -366,8 +403,8 @@ test("split context expansion aligns pure insertions and deletions", () => {
         controls(table).map((button) => button.dataset.reviewContextDirection),
       ),
       [
-        ["above", "between", "below"],
-        ["above", "between", "below"],
+        ["above", "between", "between", "below"],
+        ["above", "between", "between", "below"],
       ],
       "both panes expose the same logical context blocks",
     );
@@ -399,6 +436,511 @@ test("split context expansion aligns pure insertions and deletions", () => {
       false,
       "the expanded block control is removed from both panes",
     );
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("local context expansion reveals only the selected edge", () => {
+  const b = browser();
+  const patch = [
+    "diff --git a/src/local.ts b/src/local.ts",
+    "--- a/src/local.ts",
+    "+++ b/src/local.ts",
+    "@@ -1,110 +1,110 @@",
+    ...Array.from({ length: 110 }, (_, index) => {
+      const line = index + 1;
+      if (line === 11) return [`-old ${line}`, `+new ${line}`];
+      if (line === 100) return [`-old ${line}`, `+new ${line}`];
+      return [` context ${line}`];
+    }).flat(),
+    "",
+  ].join("\n");
+  const visibleLines = () =>
+    [
+      ...b.w.document.querySelectorAll<HTMLTableRowElement>(
+        ".d2h-diff-table tbody > tr",
+      ),
+    ]
+      .filter(
+        (row) =>
+          !row.hidden &&
+          !row.classList.contains("review-context-expansion-row"),
+      )
+      .flatMap((row) =>
+        [...row.querySelectorAll<HTMLElement>("[data-review-line]")]
+          .map((cell) => Number(cell.dataset.reviewLine))
+          .filter((line) => Number.isSafeInteger(line) && line > 0),
+      );
+  try {
+    b.state([], { patch, canExpandContext: true });
+    const controls = () =>
+      [
+        ...b.w.document.querySelectorAll<HTMLButtonElement>(
+          ".review-context-expansion-button",
+        ),
+      ].filter((button) => button.dataset.reviewContextDirection === "between");
+    assert.deepEqual(
+      controls().map((button) => button.dataset.reviewContextEdge),
+      ["up", "down"],
+    );
+    const up = controls().find(
+      (button) => button.dataset.reviewContextEdge === "up",
+    )!;
+    up.click();
+    assert.notEqual(b.messages.at(-1)?.type, "expandContext");
+    assert.ok(
+      visibleLines().includes(80),
+      `up reveals context near lower hunk: ${visibleLines()}`,
+    );
+    assert.equal(
+      visibleLines().includes(40),
+      false,
+      `up keeps upper gap collapsed: ${visibleLines()}`,
+    );
+    assert.deepEqual(
+      controls().map((button) => button.dataset.reviewContextEdge),
+      ["up", "down"],
+    );
+    controls()
+      .find((button) => button.dataset.reviewContextEdge === "down")!
+      .click();
+    assert.ok(
+      visibleLines().includes(20),
+      "down reveals context near upper hunk",
+    );
+    assert.ok(
+      visibleLines().includes(90),
+      "down preserves the lower edge reveal",
+    );
+    assert.equal(
+      visibleLines().includes(50),
+      false,
+      "the middle of the gap stays collapsed after both edge expansions",
+    );
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("bounded context responses merge only their source rows into the saved patch", () => {
+  const b = browser();
+  const base = `diff --git a/src/one.ts b/src/one.ts
+--- a/src/one.ts
++++ b/src/one.ts
+@@ -10,3 +10,3 @@
+ line ten
+-old
++new
+ line twelve
+diff --git a/src/two.ts b/src/two.ts
+--- a/src/two.ts
++++ b/src/two.ts
+@@ -1,3 +1,3 @@
+ one
+-two
++three
+ four
+`;
+  const contextRows = Array.from(
+    { length: 9 },
+    (_, index) => `line ${index + 1}`,
+  );
+  try {
+    b.state([], { patch: base });
+    b.w.dispatchEvent(
+      new b.w.MessageEvent("message", {
+        data: {
+          type: "contextExpanded",
+          regionId: "src/one.ts:above:0",
+          file: "src/one.ts",
+          direction: "above",
+          oldStart: 1,
+          oldEnd: 9,
+          newStart: 1,
+          newEnd: 9,
+          oldLines: contextRows,
+          newLines: contextRows,
+          patch: base,
+        },
+      }),
+    );
+    assert.ok(
+      b.w.document.querySelector(
+        '[data-review-file="src/one.ts"] [data-review-line="9"]',
+      ),
+    );
+    assert.ok(b.w.document.querySelector('[data-review-file="src/two.ts"]'));
+    const overlap = Array.from(
+      { length: 11 },
+      (_, index) => `line ${index + 5}`,
+    );
+    b.w.dispatchEvent(
+      new b.w.MessageEvent("message", {
+        data: {
+          type: "contextExpanded",
+          regionId: "src/one.ts:above:5-15:5-15",
+          file: "src/one.ts",
+          direction: "above",
+          oldStart: 5,
+          oldEnd: 15,
+          newStart: 5,
+          newEnd: 15,
+          oldLines: overlap,
+          newLines: overlap,
+        },
+      }),
+    );
+    assert.equal(
+      b.w.document.querySelectorAll(
+        '[data-review-file="src/one.ts"] [data-review-side="new"][data-review-line="9"]',
+      ).length,
+      1,
+      "overlapping context responses do not duplicate source rows",
+    );
+    const restored = browser();
+    try {
+      restored.state([], {
+        patch: base,
+        expandedRanges: [
+          {
+            id: "src/one.ts:above:0",
+            file: "src/one.ts",
+            direction: "above",
+            oldStart: 1,
+            oldEnd: 9,
+            newStart: 1,
+            newEnd: 9,
+          },
+        ],
+        snapshot: {
+          patch: base,
+          expandedRanges: [
+            {
+              id: "src/one.ts:above:0",
+              file: "src/one.ts",
+              direction: "above",
+              oldStart: 1,
+              oldEnd: 9,
+              newStart: 1,
+              newEnd: 9,
+            },
+          ],
+          sourceRanges: [
+            {
+              id: "src/one.ts:above:0",
+              file: "src/one.ts",
+              oldStart: 1,
+              oldLines: contextRows,
+              newStart: 1,
+              newLines: contextRows,
+              sourceKey: "test",
+            },
+          ],
+        },
+      });
+      assert.ok(
+        restored.w.document.querySelector(
+          '[data-review-file="src/one.ts"] [data-review-line="9"]',
+        ),
+        "saved source ranges are restored into the initial webview",
+      );
+    } finally {
+      restored.dom.window.close();
+    }
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("context expansion requests stay bounded and repeat for long gaps", () => {
+  const b = browser();
+  const changedHunk = (start: number, label: string) => [
+    `@@ -${start},3 +${start},3 @@`,
+    ` line ${start}`,
+    `-${label} old`,
+    `+${label} new`,
+    ` line ${start + 2}`,
+  ];
+  const longPatch = [
+    "diff --git a/src/long.ts b/src/long.ts",
+    "--- a/src/long.ts",
+    "+++ b/src/long.ts",
+    ...changedHunk(110, "first"),
+    ...changedHunk(250, "second"),
+    "",
+  ].join("\n");
+  const controls = (direction: string) =>
+    [
+      ...b.w.document.querySelectorAll<HTMLButtonElement>(
+        ".review-context-expansion-button",
+      ),
+    ].filter((button) => button.dataset.reviewContextDirection === direction);
+  const expandThree = (
+    direction: "above" | "between" | "below",
+    edge: "up" | "down",
+  ) => {
+    for (let count = 0; count < 3; count += 1) {
+      const button = controls(direction).find(
+        (candidate) => candidate.dataset.reviewContextEdge === edge,
+      );
+      assert.ok(
+        button,
+        `${direction} control should remain for repeat ${count}`,
+      );
+      const oldStart = Number(button.dataset.reviewContextOldStart);
+      const oldEnd = Number(button.dataset.reviewContextOldEnd);
+      const newStart = Number(button.dataset.reviewContextNewStart);
+      const newEnd = Number(button.dataset.reviewContextNewEnd);
+      assert.equal(oldEnd - oldStart + 1, 30);
+      assert.equal(newEnd - newStart + 1, 30);
+      button.click();
+      const request = b.messages.at(-1);
+      assert.equal(request.type, "expandContext");
+      assert.equal(request.direction, direction);
+      const oldLines = Array.from(
+        { length: oldEnd - oldStart + 1 },
+        (_, index) => `line ${oldStart + index}`,
+      );
+      const newLines = Array.from(
+        { length: newEnd - newStart + 1 },
+        (_, index) => `line ${newStart + index}`,
+      );
+      b.w.dispatchEvent(
+        new b.w.MessageEvent("message", {
+          data: {
+            type: "contextExpanded",
+            regionId: request.regionId,
+            file: request.file,
+            direction,
+            oldStart,
+            oldEnd,
+            newStart,
+            newEnd,
+            oldLines,
+            newLines,
+          },
+        }),
+      );
+    }
+  };
+  try {
+    b.state([], { patch: longPatch });
+    expandThree("above", "up");
+    for (const edge of ["up", "down", "up", "down"] as const) {
+      const button = controls("between").find(
+        (candidate) => candidate.dataset.reviewContextEdge === edge,
+      );
+      assert.ok(
+        button,
+        `between ${edge} control remains for alternating expansion`,
+      );
+      const oldStart = Number(button.dataset.reviewContextOldStart);
+      const oldEnd = Number(button.dataset.reviewContextOldEnd);
+      const newStart = Number(button.dataset.reviewContextNewStart);
+      const newEnd = Number(button.dataset.reviewContextNewEnd);
+      assert.ok(oldEnd - oldStart + 1 <= 30);
+      button.click();
+      const request = b.messages.at(-1);
+      b.w.dispatchEvent(
+        new b.w.MessageEvent("message", {
+          data: {
+            type: "contextExpanded",
+            regionId: request.regionId,
+            file: request.file,
+            direction: "between",
+            oldStart,
+            oldEnd,
+            newStart,
+            newEnd,
+            oldLines: Array.from(
+              { length: oldEnd - oldStart + 1 },
+              (_, index) => `line ${oldStart + index}`,
+            ),
+            newLines: Array.from(
+              { length: newEnd - newStart + 1 },
+              (_, index) => `line ${newStart + index}`,
+            ),
+          },
+        }),
+      );
+    }
+    expandThree("below", "down");
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("end-of-file context expansions stay exhausted after authoritative restore", () => {
+  const b = browser();
+  const base = `diff --git a/src/tail.ts b/src/tail.ts
+--- a/src/tail.ts
++++ b/src/tail.ts
+@@ -1,3 +1,3 @@
+ line one
+-line two
++line two changed
+ line three
+`;
+  try {
+    b.state([], { patch: base });
+    const below = () =>
+      [
+        ...b.w.document.querySelectorAll<HTMLButtonElement>(
+          ".review-context-expansion-button",
+        ),
+      ].find((button) => button.dataset.reviewContextDirection === "below");
+    const initial = below();
+    assert.ok(initial);
+    initial.click();
+    const request = b.messages.at(-1);
+    b.w.dispatchEvent(
+      new b.w.MessageEvent("message", {
+        data: {
+          type: "contextExpanded",
+          regionId: request.regionId,
+          file: request.file,
+          direction: "below",
+          oldStart: 4,
+          oldEnd: 4,
+          newStart: 4,
+          newEnd: 4,
+          oldLines: ["line four"],
+          newLines: ["line four"],
+          endOfFile: true,
+        },
+      }),
+    );
+    assert.equal(below(), undefined);
+    const restored = browser();
+    try {
+      restored.state([], {
+        patch: base,
+        expandedRanges: [
+          {
+            id: request.regionId,
+            file: request.file,
+            direction: "below",
+            oldStart: 4,
+            oldEnd: 4,
+            newStart: 4,
+            newEnd: 4,
+          },
+        ],
+        snapshot: {
+          patch: base,
+          expandedRanges: [
+            {
+              id: request.regionId,
+              file: request.file,
+              direction: "below",
+              oldStart: 4,
+              oldEnd: 4,
+              newStart: 4,
+              newEnd: 4,
+            },
+          ],
+          sourceRanges: [
+            {
+              id: request.regionId,
+              file: request.file,
+              oldStart: 4,
+              oldLines: ["line four"],
+              newStart: 4,
+              newLines: ["line four"],
+            },
+          ],
+        },
+      });
+      assert.equal(
+        [
+          ...restored.w.document.querySelectorAll<HTMLButtonElement>(
+            ".review-context-expansion-button",
+          ),
+        ].find((button) => button.dataset.reviewContextDirection === "below"),
+        undefined,
+      );
+    } finally {
+      restored.dom.window.close();
+    }
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("legacy 20-line tail ranges do not imply EOF after increasing the step", () => {
+  const b = browser();
+  const patch =
+    "diff --git a/tail.ts b/tail.ts\n--- a/tail.ts\n+++ b/tail.ts\n@@ -1,3 +1,3 @@\n one\n-two\n+changed\n three\n";
+  const range = {
+    id: "legacy",
+    file: "tail.ts",
+    direction: "below",
+    oldStart: 4,
+    oldEnd: 23,
+    newStart: 4,
+    newEnd: 23,
+  };
+  const lines = Array.from({ length: 20 }, (_, index) => `line ${index + 4}`);
+  try {
+    b.state([], {
+      patch,
+      snapshot: {
+        patch,
+        expandedRanges: [range],
+        sourceRanges: [{ ...range, oldLines: lines, newLines: lines }],
+      },
+    });
+    const control = b.w.document.querySelector<HTMLButtonElement>(
+      '[data-review-context-direction="below"]',
+    );
+    assert.ok(control);
+    assert.equal(control.dataset.reviewContextNewStart, "24");
+    assert.equal(control.dataset.reviewContextNewEnd, "53");
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("context expansion errors stay beside the retry control", () => {
+  const b = browser();
+  try {
+    const expansionPatch = `diff --git a/src/error.ts b/src/error.ts
+--- a/src/error.ts
++++ b/src/error.ts
+@@ -50,3 +50,3 @@
+ line fifty
+-line fifty one
++line fifty one changed
+ line fifty two
+`;
+    b.state([], { patch: expansionPatch });
+    const button = b.w.document.querySelector<HTMLButtonElement>(
+      '.review-context-expansion-button[data-review-context-direction="above"]',
+    );
+    assert.ok(button);
+    button.click();
+    const request = b.messages.at(-1);
+    b.w.dispatchEvent(
+      new b.w.MessageEvent("message", {
+        data: {
+          type: "contextError",
+          regionId: request.regionId,
+          message: "Sapling could not read this file.",
+        },
+      }),
+    );
+    assert.equal(
+      b.w.document.querySelector(".review-context-expansion-error")
+        ?.textContent,
+      "Sapling could not read this file.",
+    );
+    const messages = b.messages.length;
+    b.w.document
+      .querySelector<HTMLButtonElement>(".review-context-expansion-button")!
+      .click();
+    assert.equal(b.messages.length, messages + 1);
+    assert.equal(b.messages.at(-1).type, "expandContext");
   } finally {
     b.dom.window.close();
   }
@@ -460,6 +1002,122 @@ test("renamed files use old and new filenames for their respective anchors", () 
     });
     assert.equal(b.line(2, "old").dataset.reviewFile, "old.ts");
     assert.equal(b.line(2, "new").dataset.reviewFile, "new.ts");
+    assert.match(
+      b.w.document.querySelector<HTMLElement>(".d2h-file-name")?.textContent ??
+        "",
+      /old\.ts.*→.*new\.ts/,
+    );
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("large deleted file bodies are gated before rows enter the DOM", () => {
+  const b = browser();
+  const lines = Array.from(
+    { length: 4_001 },
+    (_, index) => `-line ${index + 1}`,
+  );
+  const largeDeleted = [
+    "diff --git a/generated.txt b/generated.txt",
+    "deleted file mode 100644",
+    "--- a/generated.txt",
+    "+++ /dev/null",
+    "@@ -1,4001 +0,0 @@",
+    ...lines,
+    "",
+  ].join("\n");
+  try {
+    b.state([], { patch: largeDeleted });
+    const file = b.w.document.querySelector<HTMLElement>(".d2h-file-wrapper")!;
+    assert.ok(file.querySelector(".review-large-file-button"));
+    assert.equal(file.querySelector('[data-review-line="4001"]'), null);
+    file.querySelector<HTMLButtonElement>(".review-large-file-button")!.click();
+    assert.ok(
+      b.w.document.querySelector('[data-review-line="4001"]'),
+      "revealing the file renders its complete body",
+    );
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("the initial file body budget is cumulative across changed files", () => {
+  const b = browser();
+  const file = (name: string) => {
+    const lines = Array.from(
+      { length: 2_500 },
+      (_, index) => `-line ${index + 1}`,
+    );
+    return [
+      `diff --git a/${name} b/${name}`,
+      `deleted file mode 100644`,
+      `--- a/${name}`,
+      "+++ /dev/null",
+      "@@ -1,2500 +0,0 @@",
+      ...lines,
+      "",
+    ].join("\n");
+  };
+  try {
+    b.state([], { patch: `${file("first.txt")}\n${file("second.txt")}` });
+    const wrappers = [
+      ...b.w.document.querySelectorAll<HTMLElement>(".d2h-file-wrapper"),
+    ];
+    assert.equal(wrappers.length, 2);
+    assert.equal(
+      wrappers[0].querySelector('[data-review-line="2500"]') !== null,
+      true,
+    );
+    assert.equal(wrappers[1].querySelector('[data-review-line="2500"]'), null);
+    assert.ok(wrappers[1].querySelector(".review-large-file-button"));
+  } finally {
+    b.dom.window.close();
+  }
+});
+
+test("comment navigation reveals a gated deleted file", () => {
+  const b = browser();
+  const lines = Array.from(
+    { length: 4_001 },
+    (_, index) => `-line ${index + 1}`,
+  );
+  const largeDeleted = [
+    "diff --git a/generated.txt b/generated.txt",
+    "deleted file mode 100644",
+    "--- a/generated.txt",
+    "+++ /dev/null",
+    "@@ -1,4001 +0,0 @@",
+    ...lines,
+    "",
+  ].join("\n");
+  try {
+    b.state(
+      [
+        {
+          id: "deleted-comment",
+          body: "Check generated output.",
+          status: "current",
+          anchor: {
+            file: "generated.txt",
+            side: "old",
+            start: 4001,
+            end: 4001,
+            text: ["line 4001"],
+          },
+        },
+      ],
+      { patch: largeDeleted },
+    );
+    b.w.document
+      .querySelector<HTMLButtonElement>(
+        '[data-index-comment-id="deleted-comment"] button',
+      )!
+      .click();
+    assert.ok(b.w.document.querySelector('[data-review-line="4001"]'));
+    assert.ok(
+      b.w.document.querySelector('[data-comment-id="deleted-comment"]'),
+    );
   } finally {
     b.dom.window.close();
   }

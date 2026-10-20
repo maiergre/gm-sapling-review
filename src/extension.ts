@@ -1,13 +1,16 @@
 import * as vscode from "vscode";
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import * as path from "node:path";
-import { realpath } from "node:fs/promises";
+import * as fs from "node:fs/promises";
 import { parse as parseDiff } from "diff2html";
 import {
+  ComparisonSnapshot,
+  ExpandedContextRange,
   ReviewStore,
   Review,
   Anchor,
+  comparisonSnapshot,
   parseCommand,
   presetCommand,
   discoverRepositories,
@@ -15,24 +18,33 @@ import {
   markdown,
 } from "./core";
 
-const FULL_CONTEXT_LINES = 1_000_000;
+const INITIAL_CONTEXT_LINES = 4;
+const EXPANSION_LINES = 30;
+const MAX_EXPANSION_LINES = 200;
+const MAX_COMMAND_OUTPUT = 32 * 1024 * 1024;
 
 export function activate(context: vscode.ExtensionContext) {
   const store = new ReviewStore(context.globalStorageUri.fsPath);
   let panel: vscode.WebviewPanel | undefined;
   let review: Review | undefined;
   let patch = "";
-  let contextLines = FULL_CONTEXT_LINES;
+  let contextLines = INITIAL_CONTEXT_LINES;
   let repositories: string[] = [];
+  let repositoryDirectories = new Map<string, string>();
+  const repositoryWorkspaceIndexes = new Map<string, number>();
+  let repositoryUriDirectories = new Map<string, string>();
   let viewMode = context.globalState.get<"inline" | "split">(
     "viewMode",
     "inline",
   );
   let queue = Promise.resolve();
-  const executable = () =>
-    vscode.workspace
+  const executable = () => {
+    const configured = vscode.workspace
       .getConfiguration("gmSapling")
-      .get<string>("commandPath", "sl");
+      .get<string>("commandPath", "");
+    if (configured?.trim()) return configured.trim();
+    return process.platform === "win32" ? "sl.exe" : "sl";
+  };
   const run = (cwd: string, args: string[]) =>
     new Promise<string>((resolve, reject) => {
       execFile(
@@ -42,12 +54,48 @@ export function activate(context: vscode.ExtensionContext) {
           cwd,
           encoding: "utf8",
           timeout: 60000,
-          maxBuffer: 32 * 1024 * 1024,
-          env: { ...process.env, HGPLAIN: "1", SL_AUTOMATION: "1" },
+          maxBuffer: MAX_COMMAND_OUTPUT,
+          env: {
+            ...process.env,
+            HGENCODING: "UTF-8",
+            SL_ENCODING: "UTF-8",
+            SL_AUTOMATION: "true",
+            // Permit the revset, progress, identity, and sniffing operations
+            // that upstream allows while still keeping the process non-
+            // interactive.
+            SL_AUTOMATION_EXCEPT: "ghrevset,phrevset,progress,sniff,username",
+            EDITOR: undefined,
+            VISUAL: undefined,
+            HGUSER: undefined,
+            HGEDITOR: process.platform === "win32" ? "exit /b 1" : "false",
+            LANG:
+              process.env.LANG && /UTF-8$/i.test(process.env.LANG)
+                ? process.env.LANG
+                : "C.UTF-8",
+          },
         },
         (error, stdout, stderr) => {
-          if (error) reject(new Error(stderr.trim() || error.message));
-          else resolve(stdout);
+          if (!error) {
+            resolve(stdout);
+            return;
+          }
+          const details = stderr.trim();
+          const typed = error as NodeJS.ErrnoException & {
+            killed?: boolean;
+            signal?: string;
+          };
+          let message: string;
+          if (typed.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER")
+            message =
+              "Sapling command output exceeded the 32 MiB limit. Narrow the diff to fewer files.";
+          else if (typed.killed || typed.signal === "SIGTERM")
+            message = "Sapling command timed out after 60 seconds.";
+          else if (typed.code === "ENOENT")
+            message = `Sapling executable was not found: ${executable()}`;
+          else if (typeof typed.code === "number")
+            message = `Sapling command failed with exit status ${typed.code}${details ? `: ${details}` : ""}`;
+          else message = details || error.message;
+          reject(new Error(message, { cause: error }));
         },
       );
     });
@@ -63,6 +111,7 @@ export function activate(context: vscode.ExtensionContext) {
     return panel?.webview.postMessage({
       type: "state",
       repo: review?.repo,
+      directory: review?.directory ?? review?.repo,
       command: review?.command,
       repos: repositories,
       reviewId: review?.id,
@@ -73,10 +122,12 @@ export function activate(context: vscode.ExtensionContext) {
       contextLines,
       canExpandContext: review ? isDiffCommand(review.command) : false,
       patch,
+      snapshot: review?.snapshot,
+      expandedRanges: review?.snapshot?.expandedRanges ?? [],
       comments:
         review?.comments.map((c) => ({
           ...c,
-          status: commentStatus(c.anchor, patch),
+          status: commentStatus(c.anchor, patch, review?.snapshot),
         })) ?? [],
     });
   };
@@ -100,24 +151,59 @@ export function activate(context: vscode.ExtensionContext) {
       "lastReviewByRepo",
       {},
     );
-    if (byRepo[repo]) return store.load(repo, byRepo[repo]);
+    const isStalePointer = (error: unknown): boolean =>
+      error instanceof Error &&
+      (/^Review not found:/.test(error.message) ||
+        /^Malformed review file:/.test(error.message) ||
+        /^Review (?:file has an invalid shape|comparison snapshot|comments|comment)/.test(
+          error.message,
+        ) ||
+        /^Review file repository or id does not match its key/.test(
+          error.message,
+        ));
+    if (typeof byRepo[repo] === "string" && byRepo[repo]) {
+      try {
+        return await store.load(repo, byRepo[repo]);
+      } catch (error) {
+        if (!isStalePointer(error)) throw error;
+        const next = { ...byRepo };
+        delete next[repo];
+        await context.workspaceState.update("lastReviewByRepo", next);
+      }
+    }
     const last = context.workspaceState.get<{
       repo: string;
       id?: string;
       command?: string;
     }>("lastReview");
     if (last?.repo === repo) {
-      if (last.id) return store.load(repo, last.id);
+      if (last.id) {
+        try {
+          return await store.load(repo, last.id);
+        } catch (error) {
+          if (!isStalePointer(error)) throw error;
+          await context.workspaceState.update("lastReview", undefined);
+        }
+      }
       if (last.command) {
         const imported = await store.resolveLegacy(repo, last.command);
         if (imported) return imported;
       }
     }
-    return store.load(repo);
+    try {
+      return await store.load(repo);
+    } catch (error) {
+      if (!isStalePointer(error)) throw error;
+      // Preserve a corrupt Default file for recovery rather than overwrite it.
+      return store.create(repo, "Default");
+    }
   }
   async function discover() {
+    const workspaceDirectories = (vscode.workspace.workspaceFolders ?? []).map(
+      (folder) => folder.uri.fsPath,
+    );
     repositories = await discoverRepositories(
-      (vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+      workspaceDirectories,
       async (dir) => {
         try {
           return (await run(dir, ["root"])).trim();
@@ -126,6 +212,36 @@ export function activate(context: vscode.ExtensionContext) {
         }
       },
     );
+    repositoryDirectories = new Map();
+    repositoryUriDirectories = new Map();
+    repositoryWorkspaceIndexes.clear();
+    for (const repository of repositories) {
+      for (const directory of workspaceDirectories) {
+        let canonicalDirectory: string;
+        try {
+          canonicalDirectory = await fs.realpath(directory);
+        } catch {
+          canonicalDirectory = path.resolve(directory);
+        }
+        if (
+          !pathWithin(canonicalDirectory, repository) &&
+          !pathWithin(repository, canonicalDirectory)
+        )
+          continue;
+        repositoryDirectories.set(
+          repository,
+          pathWithin(repository, canonicalDirectory)
+            ? canonicalDirectory
+            : repository,
+        );
+        repositoryUriDirectories.set(repository, canonicalDirectory);
+        repositoryWorkspaceIndexes.set(
+          repository,
+          workspaceDirectories.indexOf(directory),
+        );
+        break;
+      }
+    }
     if (review && !repositories.includes(review.repo))
       repositories.push(review.repo);
     return repositories;
@@ -180,6 +296,28 @@ export function activate(context: vscode.ExtensionContext) {
           throw new Error("Custom diff arguments must not include --git.");
         continue;
       }
+      if (
+        !separator &&
+        (arg === "--binary" ||
+          arg === "--no-binary" ||
+          arg === "--nodate" ||
+          arg === "--nodates" ||
+          arg === "--color")
+      ) {
+        if (rejectInternal && !legacyFullCommand)
+          throw new Error(
+            "Custom diff arguments must not include extension-owned diff flags.",
+          );
+        if (arg === "--color") index += 1;
+        continue;
+      }
+      if (!separator && /^--color=/.test(arg)) {
+        if (rejectInternal && !legacyFullCommand)
+          throw new Error(
+            "Custom diff arguments must not include extension-owned diff flags.",
+          );
+        continue;
+      }
       if (!separator && (arg === "--unified" || arg === "-U")) {
         if (rejectInternal && !legacyFullCommand)
           throw new Error("Custom diff arguments must not include --unified.");
@@ -209,7 +347,11 @@ export function activate(context: vscode.ExtensionContext) {
       return "";
     }
   };
-  const diffArgsWithContext = (command: string): string[] => {
+  const diffArgsWithContext = (
+    command: string,
+    lines = INITIAL_CONTEXT_LINES,
+    scopedFile?: string | string[],
+  ): string[] => {
     const args = parseCommand(command);
     if (args[0] !== "diff")
       throw new Error("Only sl diff commands support context expansion.");
@@ -222,6 +364,19 @@ export function activate(context: vscode.ExtensionContext) {
         index += 1;
         continue;
       }
+      if (
+        !separatorSeen &&
+        (arg === "--git" ||
+          arg === "--binary" ||
+          arg === "--no-binary" ||
+          arg === "--nodate" ||
+          arg === "--nodates" ||
+          arg === "--color")
+      ) {
+        if (arg === "--color") index += 1;
+        continue;
+      }
+      if (!separatorSeen && /^--color=/.test(arg)) continue;
       if (!separatorSeen && (/^--unified=/.test(arg) || /^-U\d+$/.test(arg)))
         continue;
       normalized.push(arg);
@@ -230,10 +385,548 @@ export function activate(context: vscode.ExtensionContext) {
     normalized.splice(
       separator < 0 ? normalized.length : separator,
       0,
+      "--git",
+      "--no-binary",
+      "--nodate",
+      "--color",
+      "never",
       "--unified",
-      String(FULL_CONTEXT_LINES),
+      String(lines),
     );
+    if (scopedFile !== undefined) {
+      // Include filters intersect existing positional arguments. Adding a
+      // positional filename would instead broaden the user's selection.
+      const boundary = normalized.indexOf("--");
+      const paths = typeof scopedFile === "string" ? [scopedFile] : scopedFile;
+      normalized.splice(
+        boundary < 0 ? normalized.length : boundary,
+        0,
+        ...[...new Set(paths)]
+          .filter((file) => file !== "/dev/null")
+          .flatMap((file) => ["--include", `path:${file}`]),
+      );
+    }
     return normalized;
+  };
+
+  const commandDirectory = (candidate: Review): string =>
+    candidate.directory?.trim() || candidate.repo;
+
+  const userArgsForSnapshot = (command: string): string[] => {
+    try {
+      return customArgsFromCommand(command);
+    } catch {
+      return [];
+    }
+  };
+
+  const makeSnapshot = async (
+    candidate: Review,
+    command: string,
+    output: string,
+  ): Promise<ComparisonSnapshot> => {
+    const snapshot = comparisonSnapshot(
+      candidate.repo,
+      commandDirectory(candidate),
+      command,
+      userArgsForSnapshot(command),
+      [
+        "--git",
+        "--no-binary",
+        "--nodate",
+        "--color",
+        "never",
+        "--unified",
+        String(INITIAL_CONTEXT_LINES),
+      ],
+      output,
+    );
+    for (const side of ["old", "new"] as const) {
+      const source = revisionForSide(command, side);
+      if (source.kind !== "revision") continue;
+      try {
+        const node = (
+          await run(candidate.repo, [
+            "log",
+            "-r",
+            source.revision,
+            "-T",
+            "{node}\n",
+          ])
+        ).trim();
+        if (/^[0-9a-f]{40}$/.test(node))
+          snapshot[side === "old" ? "oldRevision" : "newRevision"] = node;
+      } catch {
+        /* A custom comparison may still have a valid patch. */
+      }
+    }
+    return snapshot;
+  };
+
+  const normalizedRelativePath = (file: string): string => {
+    const normalized = file.replaceAll("\\", "/").replace(/^\.\//, "");
+    if (
+      !normalized ||
+      normalized === "." ||
+      normalized.startsWith("/") ||
+      normalized.split("/").includes("..")
+    )
+      throw new Error("The comparison file is outside the repository.");
+    return normalized;
+  };
+
+  const pathWithin = (root: string, candidate: string): boolean => {
+    const relative = path.relative(root, candidate);
+    return (
+      relative === "" ||
+      (!relative.startsWith(".." + path.sep) &&
+        relative !== ".." &&
+        !path.isAbsolute(relative))
+    );
+  };
+
+  const uriForRepositoryPath = (
+    file: string,
+    repository?: string,
+  ): vscode.Uri => {
+    const canonicalFolder =
+      repository && repositoryUriDirectories.get(repository);
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    // Discovery records the canonical path separately from the URI spelling.
+    const index = repository
+      ? repositoryWorkspaceIndexes.get(repository)
+      : undefined;
+    const folder =
+      index !== undefined
+        ? folders[index]
+        : folders.find((f) => pathWithin(f.uri.fsPath, file));
+    if (!folder || folder.uri.scheme === "file") return vscode.Uri.file(file);
+    return vscode.Uri.joinPath(
+      folder.uri,
+      path.relative(canonicalFolder || folder.uri.fsPath, file),
+    );
+  };
+
+  type ComparisonSource =
+    | { kind: "revision"; revision: string }
+    | { kind: "workingCopy" }
+    | { kind: "unresolved" };
+
+  const revisionForSide = (
+    command: string,
+    side: "old" | "new",
+  ): ComparisonSource => {
+    let args: string[];
+    try {
+      args = parseCommand(command);
+    } catch {
+      return { kind: "unresolved" };
+    }
+    const revisions: string[] = [];
+    for (let index = 0; index < args.length; index += 1) {
+      const arg = args[index];
+      if (arg === "--") break;
+      if (
+        arg === "--change" ||
+        arg === "-c" ||
+        /^-c.+/.test(arg) ||
+        arg.startsWith("--change=")
+      )
+        return { kind: "unresolved" };
+      if (arg === "--rev" || arg === "-r") {
+        const revision = args[++index];
+        if (revision) revisions.push(revision);
+      } else if (arg.startsWith("--rev="))
+        revisions.push(arg.slice("--rev=".length));
+      else if (arg.startsWith("-r") && arg.length > 2)
+        revisions.push(arg.slice(2));
+    }
+    const revision = side === "old" ? (revisions[0] ?? ".") : revisions[1];
+    if (revision === undefined) return { kind: "workingCopy" };
+    // Expressions involving a range or revset cannot be mapped to one cat
+    // revision without changing comparison semantics. They must go through
+    // the file-scoped diff fallback, never be mistaken for working-copy text.
+    if (/[,:;]|\.\./.test(revision)) return { kind: "unresolved" };
+    return { kind: "revision", revision };
+  };
+
+  const sourceKeyFor = (
+    candidate: Review,
+    side: "old" | "new",
+    file: string,
+  ): string =>
+    createHash("sha256")
+      .update(
+        `${candidate.command}\0${commandDirectory(candidate)}\0${side}\0${file}\0${candidate.snapshot?.patch ?? candidate.patch ?? ""}`,
+      )
+      .digest("hex");
+
+  type ContextRequest = {
+    file?: unknown;
+    direction?: unknown;
+    regionId?: unknown;
+    oldStart?: unknown;
+    oldEnd?: unknown;
+    newStart?: unknown;
+    newEnd?: unknown;
+  };
+
+  type ContextResponse = {
+    region: ExpandedContextRange;
+    oldLines: string[];
+    newLines: string[];
+    patch: string;
+    sourceKey: string;
+  };
+
+  const boundedNumber = (value: unknown): number | undefined =>
+    Number.isSafeInteger(value) && (value as number) >= 1
+      ? (value as number)
+      : undefined;
+
+  const rangeFromRequest = (
+    request: ContextRequest,
+    candidate: Review,
+  ): ExpandedContextRange => {
+    const file = normalizedRelativePath(String(request.file ?? ""));
+    const direction = request.direction;
+    if (
+      direction !== "above" &&
+      direction !== "below" &&
+      direction !== "between"
+    )
+      throw new Error("Invalid context expansion direction.");
+    let oldStart = boundedNumber(request.oldStart);
+    let oldEnd = boundedNumber(request.oldEnd);
+    let newStart = boundedNumber(request.newStart);
+    let newEnd = boundedNumber(request.newEnd);
+    const comparisonFile = (
+      candidate.snapshot?.files ??
+      comparisonSnapshot(
+        candidate.repo,
+        commandDirectory(candidate),
+        candidate.command,
+        [],
+        [],
+        candidate.patch ?? "",
+      ).files
+    ).find((item) => item.oldPath === file || item.newPath === file);
+    const oldFile = comparisonFile?.oldPath ?? file;
+    const newFile = comparisonFile?.newPath ?? file;
+    const parsed = candidate.snapshot?.patch ?? candidate.patch ?? "";
+    if ((!oldStart || !oldEnd || !newStart || !newEnd) && parsed) {
+      const found = parseDiff(parsed).find((item) =>
+        [item.oldName, item.newName]
+          .filter((name): name is string => !!name)
+          .some((name) => normalizedRelativePath(name) === file),
+      );
+      const blocks = found?.blocks ?? [];
+      const first = blocks[0]?.header?.match(
+        /@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?/,
+      );
+      const last = blocks
+        .at(-1)
+        ?.header?.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?/);
+      if (first && last) {
+        const firstOld = Number(first[1]);
+        const firstOldCount = Number(first[2] ?? 1);
+        const firstNew = Number(first[3]);
+        const firstNewCount = Number(first[4] ?? 1);
+        const lastOld = Number(last[1]);
+        const lastOldCount = Number(last[2] ?? 1);
+        const lastNew = Number(last[3]);
+        const lastNewCount = Number(last[4] ?? 1);
+        if (direction === "above") {
+          oldEnd ??= Math.max(1, firstOld - 1);
+          newEnd ??= Math.max(1, firstNew - 1);
+          oldStart ??= Math.max(1, oldEnd - EXPANSION_LINES + 1);
+          newStart ??= Math.max(1, newEnd - EXPANSION_LINES + 1);
+        } else if (direction === "below") {
+          oldStart ??= lastOld + lastOldCount;
+          newStart ??= lastNew + lastNewCount;
+          oldEnd ??= oldStart + EXPANSION_LINES - 1;
+          newEnd ??= newStart + EXPANSION_LINES - 1;
+        } else {
+          oldStart ??= firstOld + firstOldCount;
+          newStart ??= firstNew + firstNewCount;
+          oldEnd ??= Math.max(oldStart, lastOld - 1);
+          newEnd ??= Math.max(newStart, lastNew - 1);
+        }
+      }
+    }
+    oldStart ??= 1;
+    newStart ??= 1;
+    oldEnd ??= oldStart + EXPANSION_LINES - 1;
+    newEnd ??= newStart + EXPANSION_LINES - 1;
+    // A single click is deliberately bounded. The UI asks again with the
+    // next range when a gap is larger than this, so one expansion cannot
+    // turn a four-line patch into an unbounded source dump.
+    const perClickLimit = Math.min(EXPANSION_LINES, MAX_EXPANSION_LINES);
+    oldEnd = Math.max(
+      oldStart - 1,
+      Math.min(oldEnd, oldStart + perClickLimit - 1),
+    );
+    newEnd = Math.max(
+      newStart - 1,
+      Math.min(newEnd, newStart + perClickLimit - 1),
+    );
+    const id =
+      typeof request.regionId === "string" && request.regionId.trim()
+        ? request.regionId
+        : `${file}:${direction}:${oldStart}-${oldEnd}:${newStart}-${newEnd}`;
+    return {
+      id,
+      file,
+      oldFile,
+      newFile,
+      direction,
+      oldStart,
+      oldEnd,
+      newStart,
+      newEnd,
+    };
+  };
+
+  const linesFromPatch = (
+    output: string,
+    file: string,
+    side: "old" | "new",
+    start: number,
+    end: number,
+  ): string[] => {
+    if (end < start) return [];
+    const parsed = parseDiff(output).find((item) =>
+      [item.oldName, item.newName]
+        .filter((name): name is string => !!name)
+        .some((name) => normalizedRelativePath(name) === file),
+    );
+    if (!parsed) return [];
+    return parsed.blocks
+      .flatMap((block) => block.lines)
+      .filter((line) => {
+        const number = side === "old" ? line.oldNumber : line.newNumber;
+        return number !== undefined && number >= start && number <= end;
+      })
+      .map((line) => (line.content.length ? line.content.slice(1) : ""));
+  };
+
+  const changedSignature = (output: string, file: string): string => {
+    try {
+      const parsed = parseDiff(output).find((item) =>
+        [item.oldName, item.newName]
+          .filter((name): name is string => !!name)
+          .some((name) => normalizedRelativePath(name) === file),
+      );
+      return (parsed?.blocks ?? [])
+        .flatMap((block) => block.lines)
+        .filter((line) => line.type !== "context")
+        .map(
+          (line) =>
+            `${line.type}:${line.oldNumber ?? ""}:${line.newNumber ?? ""}:${line.content.length ? line.content.slice(1) : ""}`,
+        )
+        .join("\n");
+    } catch {
+      return "";
+    }
+  };
+
+  const gapsForFile = (candidate: Review, file: string) => {
+    const parsed = parseDiff(
+      candidate.snapshot?.patch ?? candidate.patch ?? "",
+    ).find((f) => f.oldName === file || f.newName === file);
+    if (!parsed || parsed.isNew || parsed.isDeleted || !parsed.blocks.length)
+      return [];
+    const gaps: Array<{
+      oldStart: number;
+      newStart: number;
+      oldEnd: number;
+      newEnd: number;
+    }> = [];
+    let oldStart = 1,
+      newStart = 1;
+    for (const block of parsed.blocks) {
+      const match = block.header.match(
+        /@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))?/,
+      );
+      if (!match) continue;
+      const old = Number(match[1]),
+        next = Number(match[3]);
+      if (old > oldStart && next > newStart)
+        gaps.push({ oldStart, newStart, oldEnd: old - 1, newEnd: next - 1 });
+      oldStart = old + Number(match[2] ?? 1);
+      newStart = next + Number(match[4] ?? 1);
+    }
+    gaps.push({ oldStart, newStart, oldEnd: Infinity, newEnd: Infinity });
+    return gaps;
+  };
+
+  const readContext = async (
+    candidate: Review,
+    region: ExpandedContextRange,
+  ): Promise<ContextResponse> => {
+    const basePatch = candidate.snapshot?.patch ?? candidate.patch ?? "";
+    const cached = candidate.snapshot?.sourceRanges.find(
+      (r) =>
+        r.id === region.id &&
+        r.oldStart === region.oldStart &&
+        r.newStart === region.newStart,
+    );
+    if (cached?.oldLines && cached.newLines)
+      return {
+        region: {
+          ...region,
+          oldEnd: region.oldStart + cached.oldLines.length - 1,
+          newEnd: region.newStart + cached.newLines.length - 1,
+        },
+        oldLines: cached.oldLines,
+        newLines: cached.newLines,
+        patch: "",
+        sourceKey: cached.sourceKey,
+      };
+    const gap = gapsForFile(candidate, region.file).find(
+      (g) =>
+        region.oldStart >= g.oldStart &&
+        region.newStart >= g.newStart &&
+        region.oldEnd <= g.oldEnd &&
+        region.newEnd <= g.newEnd &&
+        region.oldStart - g.oldStart === region.newStart - g.newStart,
+    );
+    if (
+      !gap ||
+      region.oldEnd - region.oldStart !== region.newEnd - region.newStart
+    )
+      throw new Error(
+        "This context range no longer matches the comparison. Refresh the review.",
+      );
+    const sourceLines = (text: string) => {
+      const lines = text ? text.split(/\r?\n/) : [];
+      if (lines.at(-1) === "") lines.pop();
+      return lines;
+    };
+    const readSide = async (
+      side: "old" | "new",
+      start: number,
+      end: number,
+    ): Promise<string[]> => {
+      const file =
+        side === "old"
+          ? (region.oldFile ?? region.file)
+          : (region.newFile ?? region.file);
+      const pinned =
+        candidate.snapshot?.[side === "old" ? "oldRevision" : "newRevision"];
+      const source = pinned
+        ? { kind: "revision" as const, revision: pinned }
+        : revisionForSide(candidate.command, side);
+      if (source.kind === "unresolved")
+        throw new Error("Unresolved comparison side");
+      let text: string;
+      if (source.kind === "workingCopy") {
+        const root = await fs.realpath(candidate.repo);
+        const filename = await fs.realpath(
+          path.resolve(root, normalizedRelativePath(file)),
+        );
+        if (!pathWithin(root, filename))
+          throw new Error("File is outside the repository.");
+        if ((await fs.stat(filename)).size > MAX_COMMAND_OUTPUT)
+          throw new Error(
+            "Source exceeds the 32 MiB limit. Narrow the comparison.",
+          );
+        text = await fs.readFile(filename, "utf8");
+      } else {
+        text = await run(candidate.repo, [
+          "cat",
+          "--rev",
+          source.revision,
+          "--",
+          file,
+        ]);
+      }
+      return sourceLines(text).slice(start - 1, end);
+    };
+    let oldLines: string[] | undefined, newLines: string[] | undefined;
+    try {
+      oldLines = await readSide("old", region.oldStart, region.oldEnd);
+    } catch {
+      /* scoped fallback below */
+    }
+    try {
+      newLines = await readSide("new", region.newStart, region.newEnd);
+    } catch {
+      /* scoped fallback below */
+    }
+    // Only the selected file is rerun. Known source sides use a four-line
+    // validation patch; unresolved custom comparisons get bounded extra context.
+    const distance =
+      Math.min(
+        region.oldEnd - gap.oldStart + 1,
+        Number.isFinite(gap.oldEnd)
+          ? gap.oldEnd - region.oldStart + 1
+          : Infinity,
+      ) + INITIAL_CONTEXT_LINES;
+    const fallback = oldLines === undefined || newLines === undefined;
+    if (fallback && distance > 100_000)
+      throw new Error(
+        "This custom comparison needs too much context. Narrow the diff or use explicit --rev arguments.",
+      );
+    const scopedPatch = validatePatch(
+      await run(commandDirectory(candidate), [
+        "--color",
+        "never",
+        ...diffArgsWithContext(
+          candidate.command,
+          fallback
+            ? Math.max(EXPANSION_LINES, distance)
+            : INITIAL_CONTEXT_LINES,
+          [region.oldFile ?? region.file, region.newFile ?? region.file],
+        ),
+      ]),
+    );
+    if (
+      changedSignature(basePatch, region.file) !==
+      changedSignature(scopedPatch, region.file)
+    )
+      throw new Error(
+        `The comparison changed while loading ${region.file}. Refresh the review and try again.`,
+      );
+    if (oldLines === undefined)
+      oldLines = linesFromPatch(
+        scopedPatch,
+        region.file,
+        "old",
+        region.oldStart,
+        region.oldEnd,
+      );
+    if (newLines === undefined)
+      newLines = linesFromPatch(
+        scopedPatch,
+        region.file,
+        "new",
+        region.newStart,
+        region.newEnd,
+      );
+    if (
+      oldLines.length !== newLines.length ||
+      oldLines.some((line, i) => line !== newLines![i])
+    )
+      throw new Error(
+        "The requested lines are no longer unchanged context. Refresh the review.",
+      );
+    const count = region.oldEnd - region.oldStart + 1;
+    if (Number.isFinite(gap.oldEnd) && oldLines.length !== count)
+      throw new Error(
+        "Unable to resolve the complete context range. Refresh the review.",
+      );
+    return {
+      region: {
+        ...region,
+        oldEnd: region.oldStart + oldLines.length - 1,
+        newEnd: region.newStart + newLines.length - 1,
+      },
+      oldLines,
+      newLines,
+      patch: "",
+      sourceKey: sourceKeyFor(candidate, "new", region.file),
+    };
   };
   type RequestedDiff = { choice?: string; command?: string };
   const commandForChoice = (requested: RequestedDiff): string => {
@@ -262,45 +955,149 @@ export function activate(context: vscode.ExtensionContext) {
       : isPreset(review.command)
         ? review.command
         : canonicalCustomCommand(review.command);
-    const nextReview = { ...review, command };
-    const next = await run(nextReview.repo, [
+    const nextReview = {
+      ...review,
+      command,
+      directory: review.directory ?? review.repo,
+    };
+    const next = await run(commandDirectory(nextReview), [
       "--color",
       "never",
       ...diffArgsWithContext(command),
     ]);
     validatePatch(next);
-    const savedReview = { ...nextReview, patch: next };
+    const snapshot = await makeSnapshot(nextReview, command, next);
+    const savedReview = { ...nextReview, patch: next, snapshot };
     review = await store.save(savedReview);
     patch = next;
-    contextLines = FULL_CONTEXT_LINES;
+    contextLines = INITIAL_CONTEXT_LINES;
+    await restoreCommentContexts();
     await remember();
     await send();
   }
 
-  // Older saved reviews may contain a truncated patch. Keep a one-time host
-  // fallback for their header-gap controls; current refreshes always fetch
-  // full context and expand locally in the webview.
-  async function expandContext(message: {
-    file?: unknown;
-    direction?: unknown;
-  }) {
+  async function expandContext(message: ContextRequest) {
     if (!review || !isDiffCommand(review.command)) return;
     if (!vscode.workspace.isTrusted)
       throw new Error("Trust this workspace before expanding diff context.");
-    if (
-      typeof message.file !== "string" ||
-      !["above", "below", "between"].includes(String(message.direction))
-    )
-      return;
-    const next = await run(review.repo, [
-      "--color",
-      "never",
-      ...diffArgsWithContext(review.command),
-    ]);
-    validatePatch(next);
-    patch = next;
-    contextLines = FULL_CONTEXT_LINES;
+    const requestedRegion = rangeFromRequest(message, review);
+    const response = await readContext(review, requestedRegion);
+    const region = response.region;
+    const prior =
+      review.snapshot ?? (await makeSnapshot(review, review.command, patch));
+    const snapshot: ComparisonSnapshot = {
+      ...prior,
+      patch: prior.patch || patch,
+      expandedRanges: [
+        ...prior.expandedRanges.filter((item) => item.id !== region.id),
+        region,
+      ],
+      sourceRanges: [
+        ...prior.sourceRanges.filter((item) => item.id !== region.id),
+        {
+          id: region.id,
+          file: region.file,
+          oldFile: region.oldFile,
+          newFile: region.newFile,
+          oldStart: region.oldStart,
+          oldLines: response.oldLines,
+          newStart: region.newStart,
+          newLines: response.newLines,
+          sourceKey: response.sourceKey,
+          endOfFile:
+            region.direction === "below" &&
+            response.oldLines.length < EXPANSION_LINES,
+        },
+      ],
+    };
+    // Snapshot writes are intentionally separate from review edits. A failed
+    // expansion therefore leaves the last successful patch and comments
+    // intact, while a successful one survives a panel restart.
+    review = await store.saveSnapshot(review, snapshot);
+    patch = snapshot.patch;
+    contextLines = INITIAL_CONTEXT_LINES;
+    await panel?.webview.postMessage({
+      type: "contextExpanded",
+      regionId: region.id,
+      file: region.file,
+      direction: region.direction,
+      oldStart: region.oldStart,
+      oldEnd: region.oldEnd,
+      newStart: region.newStart,
+      newEnd: region.newEnd,
+      oldLines: response.oldLines,
+      newLines: response.newLines,
+      patch: response.patch,
+      endOfFile:
+        region.direction === "below" &&
+        response.oldLines.length < EXPANSION_LINES,
+    });
     await send();
+  }
+
+  async function restoreCommentContexts(): Promise<void> {
+    if (!review || !review.comments.length || !isDiffCommand(review.command))
+      return;
+    const candidate = review;
+    let snapshot =
+      candidate.snapshot ??
+      (await makeSnapshot(candidate, candidate.command, patch));
+    for (const comment of candidate.comments) {
+      if (commentStatus(comment.anchor, patch, snapshot) === "current")
+        continue;
+      const anchor = comment.anchor;
+      const file = snapshot.files.find(
+        (f) => (anchor.side === "old" ? f.oldPath : f.newPath) === anchor.file,
+      );
+      if (!file) continue;
+      let rangeIndex = 0;
+      for (const gap of gapsForFile(candidate, anchor.file)) {
+        const gapStart = anchor.side === "old" ? gap.oldStart : gap.newStart;
+        const gapEnd = anchor.side === "old" ? gap.oldEnd : gap.newEnd;
+        const start = Math.max(anchor.start, gapStart);
+        const end = Math.min(anchor.end, gapEnd);
+        for (let cursor = start; cursor <= end; cursor += MAX_EXPANSION_LINES) {
+          const offset = cursor - gapStart;
+          const length = Math.min(MAX_EXPANSION_LINES, end - cursor + 1);
+          const region: ExpandedContextRange = {
+            id: `comment:${comment.id}${rangeIndex++ ? `:${cursor}` : ""}`,
+            file: anchor.file,
+            oldFile: file.oldPath,
+            newFile: file.newPath,
+            direction: "between",
+            oldStart: gap.oldStart + offset,
+            oldEnd: gap.oldStart + offset + length - 1,
+            newStart: gap.newStart + offset,
+            newEnd: gap.newStart + offset + length - 1,
+          };
+          try {
+            const response = await readContext(
+              { ...candidate, snapshot },
+              region,
+            );
+            snapshot = {
+              ...snapshot,
+              expandedRanges: [
+                ...snapshot.expandedRanges.filter((r) => r.id !== region.id),
+                response.region,
+              ],
+              sourceRanges: [
+                ...snapshot.sourceRanges.filter((r) => r.id !== region.id),
+                {
+                  ...response.region,
+                  oldLines: response.oldLines,
+                  newLines: response.newLines,
+                  sourceKey: response.sourceKey,
+                },
+              ],
+            };
+          } catch {
+            /* Missing or changed source stays outdated. */
+          }
+        }
+      }
+    }
+    review = await store.saveSnapshot(candidate, snapshot);
   }
 
   async function choose(custom = false, requested?: RequestedDiff) {
@@ -352,25 +1149,45 @@ export function activate(context: vscode.ExtensionContext) {
       if (entered === undefined) return;
       command = canonicalCustomCommand(entered);
     }
+    const selectedReview = {
+      ...selected,
+      directory: selected.directory ?? repositoryDirectories.get(repo) ?? repo,
+    };
     const nextPatch = validatePatch(
-      await run(repo, ["--color", "never", ...diffArgsWithContext(command)]),
+      await run(commandDirectory(selectedReview), [
+        "--color",
+        "never",
+        ...diffArgsWithContext(command),
+      ]),
     );
-    review = await store.save({ ...selected, command, patch: nextPatch });
+    review = await store.save({
+      ...selectedReview,
+      command,
+      patch: nextPatch,
+      snapshot: await makeSnapshot(selectedReview, command, nextPatch),
+    });
     patch = nextPatch;
-    contextLines = FULL_CONTEXT_LINES;
+    contextLines = INITIAL_CONTEXT_LINES;
+    await restoreCommentContexts();
     await remember();
     ensurePanel();
     await send();
   }
   async function selectReview(repo: string, id: string) {
     review = await store.load(repo, id);
+    if (!review.directory) {
+      const directory = repositoryDirectories.get(repo) ?? repo;
+      review = { ...review, directory };
+      if (review.patch !== undefined || review.snapshot !== undefined)
+        review = await store.save(review);
+    }
     if (!isPreset(review.command) && isDiffCommand(review.command)) {
       const normalized = canonicalCustomCommand(review.command);
       if (normalized !== review.command)
         review = await store.save({ ...review, command: normalized });
     }
     patch = review.patch ?? "";
-    contextLines = FULL_CONTEXT_LINES;
+    contextLines = INITIAL_CONTEXT_LINES;
     await remember();
     await send();
     if (isPreset(review.command) && vscode.workspace.isTrusted) await refresh();
@@ -384,8 +1201,9 @@ export function activate(context: vscode.ExtensionContext) {
         .trim()
         .replace(/[. ]+$/g, "") || "default";
     const target = await vscode.window.showSaveDialog({
-      defaultUri: vscode.Uri.file(
+      defaultUri: uriForRepositoryPath(
         path.join(selected.repo, `00-review-${name}-${date}.md`),
+        selected.repo,
       ),
       filters: { Markdown: ["md"] },
     });
@@ -600,7 +1418,15 @@ export function activate(context: vscode.ExtensionContext) {
             return;
           }
           if (message.type === "expandContext") {
-            await expandContext(message);
+            try {
+              await expandContext(message);
+            } catch (error) {
+              await panel?.webview.postMessage({
+                type: "contextError",
+                regionId: message.regionId,
+                message: error instanceof Error ? error.message : String(error),
+              });
+            }
             return;
           }
           if (!review) return;
@@ -625,6 +1451,8 @@ export function activate(context: vscode.ExtensionContext) {
               review = await store.save({
                 ...next,
                 patch: review.patch ?? patch,
+                directory: review.directory,
+                snapshot: review.snapshot,
               });
               await remember();
               await send();
@@ -673,8 +1501,8 @@ export function activate(context: vscode.ExtensionContext) {
                 message.line < 1
               )
                 return;
-              const root = await realpath(review.repo);
-              const file = await realpath(path.resolve(root, message.file));
+              const root = await fs.realpath(review.repo);
+              const file = await fs.realpath(path.resolve(root, message.file));
               const relative = path.relative(root, file);
               if (
                 relative.startsWith(".." + path.sep) ||
@@ -682,9 +1510,16 @@ export function activate(context: vscode.ExtensionContext) {
                 path.isAbsolute(relative)
               )
                 throw new Error("File is outside the repository.");
-              const document = await vscode.workspace.openTextDocument(
-                vscode.Uri.file(file),
-              );
+              const fileUri = uriForRepositoryPath(file, review.repo);
+              const image = /\.(?:png|jpe?g|gif|bmp|webp|svg|ico)$/i.test(file);
+              if (
+                image &&
+                typeof vscode.commands.executeCommand === "function"
+              ) {
+                await vscode.commands.executeCommand("vscode.open", fileUri);
+                break;
+              }
+              const document = await vscode.workspace.openTextDocument(fileUri);
               const editor = await vscode.window.showTextDocument(document, {
                 preview: true,
               });
@@ -722,29 +1557,56 @@ export function activate(context: vscode.ExtensionContext) {
         ensurePanel(restored);
         return serial(async () => {
           await discover();
-          if (last) {
-            const selected = await rememberedReview(last.repo);
-            await selectReview(last.repo, selected.id);
-          } else await send();
+          if (last && !repositories.includes(last.repo)) {
+            await context.workspaceState.update("lastReview", undefined);
+            const byRepo = context.workspaceState.get<Record<string, string>>(
+              "lastReviewByRepo",
+              {},
+            );
+            if (byRepo[last.repo] !== undefined) {
+              const next = { ...byRepo };
+              delete next[last.repo];
+              await context.workspaceState.update("lastReviewByRepo", next);
+            }
+          }
+          const rememberedRepo =
+            last && repositories.includes(last.repo)
+              ? last.repo
+              : repositories[0];
+          if (rememberedRepo) {
+            const selected = await rememberedReview(rememberedRepo);
+            await selectReview(rememberedRepo, selected.id);
+          } else {
+            review = undefined;
+            patch = "";
+            await send();
+          }
         });
       },
     }),
     vscode.workspace.onDidSaveTextDocument((document) => {
-      if (
-        review &&
-        panel &&
-        document.uri.scheme === "file" &&
-        document.uri.fsPath.startsWith(review.repo + path.sep)
-      ) {
-        // Custom commands run only on explicit refresh; they can have side effects.
-        if (isPreset(review.command)) serial(refresh);
+      if (!review || !panel || !document.uri.fsPath) return;
+      const selectedRepo = review.repo;
+      serial(async () => {
+        if (!review || review.repo !== selectedRepo || !panel) return;
+        let root: string, file: string;
+        try {
+          [root, file] = await Promise.all([
+            fs.realpath(selectedRepo),
+            fs.realpath(document.uri.fsPath),
+          ]);
+        } catch {
+          return;
+        }
+        if (!pathWithin(root, file)) return;
+        if (isPreset(review.command)) await refresh();
         else
-          void panel.webview.postMessage({
+          await panel.webview.postMessage({
             type: "error",
             message:
               "Files changed. Refresh the custom diff to update comment locations.",
           });
-      }
+      });
     }),
   );
 }

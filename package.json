@@ -2,7 +2,7 @@
   "name": "gm-sapling-review",
   "displayName": "Sapling Review",
   "description": "Syntax-highlighted Sapling diffs with persistent local review comments.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "gregor",
   "license": "MIT",
   "engines": {
@@ -39,8 +39,8 @@
       "properties": {
         "gmSapling.commandPath": {
           "type": "string",
-          "default": "sl",
-          "description": "Path to the Sapling executable."
+          "default": "",
+          "description": "Path to the Sapling executable. Leave empty to use sl (sl.exe on Windows)."
         }
       }
     }

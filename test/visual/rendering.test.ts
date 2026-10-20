@@ -20,6 +20,12 @@ const patch = `diff --git a/config.toml b/config.toml
 +
 +[[package]]
 +name = "another-package"
+@@ -1300,4 +1303,4 @@
+ [[package]]
+ name = "tail-package"
+-version = "1.0.0"
++version = "1.0.1"
+ checksum = "tail"
 diff --git a/docs/REVIEW.md b/docs/REVIEW.md
 --- a/docs/REVIEW.md
 +++ b/docs/REVIEW.md
@@ -272,6 +278,9 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
             contextBlankBackground: contextBlank
               ? getComputedStyle(contextBlank).backgroundColor
               : undefined,
+            contextBlankRgb: contextBlank
+              ? rgb(getComputedStyle(contextBlank).backgroundColor)
+              : undefined,
             comment: commentCard
               ? (() => {
                   const style = getComputedStyle(commentCard);
@@ -301,6 +310,56 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
                 .getBoundingClientRect()
                 .toJSON(),
             })),
+            contextButtonPaneCounts: [
+              ...d.querySelectorAll<HTMLElement>(".d2h-file-side-diff"),
+            ].map(
+              (pane) =>
+                pane.querySelectorAll(".review-context-expansion-button")
+                  .length,
+            ),
+            contextHeaders: [
+              ...d.querySelectorAll<HTMLElement>(
+                ".review-context-expansion-row .review-context-expansion-code .d2h-code-line, .review-context-expansion-row .review-context-expansion-code .d2h-code-side-line",
+              ),
+            ].map((header) => header.textContent?.trim() ?? ""),
+            contextHeaderColors: [
+              ...d.querySelectorAll<HTMLElement>(
+                ".review-context-expansion-row .review-context-expansion-code .d2h-code-line, .review-context-expansion-row .review-context-expansion-code .d2h-code-side-line",
+              ),
+            ].map((header) => getComputedStyle(header).color),
+            contextButtonStyles: [
+              ...d.querySelectorAll<HTMLButtonElement>(
+                ".review-context-expansion-button",
+              ),
+            ].map((button) => {
+              const row = button.closest("tr")!;
+              const cell = row.querySelector("td")!;
+              const style = getComputedStyle(cell);
+              const buttonStyle = getComputedStyle(button);
+              return {
+                cells: row.querySelectorAll(":scope > td").length,
+                colSpan: (cell as HTMLTableCellElement).colSpan,
+                icons: button.querySelectorAll("svg").length,
+                label: button.querySelector(".review-context-expansion-label")
+                  ?.textContent,
+                labelDisplay: getComputedStyle(
+                  button.querySelector(".review-context-expansion-label")!,
+                ).display,
+                background: style.backgroundColor,
+                backgroundRgb: rgb(style.backgroundColor),
+                contextBlankRgb: contextBlank
+                  ? rgb(getComputedStyle(contextBlank).backgroundColor)
+                  : undefined,
+                text: buttonStyle.color,
+                textRgb: rgb(buttonStyle.color),
+                borderTopColor: style.borderTopColor,
+                borderTopStyle: style.borderTopStyle,
+                borderTopWidth: style.borderTopWidth,
+                borderBottomColor: style.borderBottomColor,
+                borderBottomStyle: style.borderBottomStyle,
+                borderBottomWidth: style.borderBottomWidth,
+              };
+            }),
             contextRows,
           };
         });
@@ -430,11 +489,60 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
         );
         for (const bounds of metrics.contextButtonBounds) {
           assert.ok(
+            bounds.button.width >= 28 && bounds.button.height >= 28,
+            `${layout} context expansion control has a large click target: ${JSON.stringify(bounds.button)}`,
+          );
+          assert.ok(
             bounds.button.left >= bounds.scroller.left - 1 &&
               bounds.button.right <= bounds.scroller.right + 1,
             `${layout} context expansion control stays within its visible pane: ${JSON.stringify(bounds)}`,
           );
         }
+        assert.ok(
+          metrics.contextHeaders.length > 0 &&
+            metrics.contextHeaders.every((header) => header.startsWith("@@")),
+          `${theme}/${layout} expansion separators retain actual hunk headers: ${JSON.stringify(metrics.contextHeaders)}`,
+        );
+        assert.equal(
+          new Set(metrics.contextHeaderColors).size,
+          1,
+          `${theme}/${layout} expansion hunk headers use one foreground color: ${JSON.stringify(metrics.contextHeaderColors)}`,
+        );
+        if (layout === "Side by side") {
+          assert.ok(metrics.contextButtonPaneCounts.length >= 2);
+          assert.ok(
+            metrics.contextButtonPaneCounts.every((count) => count > 0),
+            `${theme}/${layout} both line-number gutters have expansion controls: ${metrics.contextButtonPaneCounts}`,
+          );
+        }
+        assert.ok(
+          metrics.contextButtonStyles.every(
+            (separator) =>
+              separator.cells === 2 &&
+              separator.colSpan === 1 &&
+              separator.icons === 1 &&
+              separator.label?.startsWith("Show ") &&
+              separator.labelDisplay === "block" &&
+              separator.borderTopStyle === "solid" &&
+              separator.borderTopWidth === "1px" &&
+              separator.borderBottomStyle === "solid" &&
+              separator.borderBottomWidth === "1px" &&
+              separator.background !== "rgba(0, 0, 0, 0)" &&
+              separator.text !== "rgba(0, 0, 0, 0)" &&
+              separator.borderTopColor !== separator.background &&
+              separator.borderBottomColor !== separator.background &&
+              separator.contextBlankRgb !== undefined &&
+              separator.backgroundRgb.some(
+                (channel, index) =>
+                  Math.abs(channel - separator.contextBlankRgb![index]) > 4,
+              ) &&
+              separator.textRgb.some(
+                (channel, index) =>
+                  Math.abs(channel - separator.backgroundRgb[index]) > 30,
+              ),
+          ),
+          `${theme}/${layout} expansion separators have icons, contrast, and borders`,
+        );
         for (const color of metrics.backgrounds) {
           const brightness = color.reduce((a, b) => a + b, 0) / 3;
           assert.ok(

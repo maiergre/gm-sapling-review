@@ -21,6 +21,60 @@ export type ReviewComment = {
   updatedAt: string;
 };
 
+/** A path as it appeared on either side of a comparison. */
+export type ComparisonFile = {
+  oldPath?: string;
+  newPath?: string;
+};
+
+/**
+ * Source text loaded for a bounded context range. Keeping this separate from
+ * the patch lets a review retain the four-line initial diff while still
+ * validating comments on rows revealed later.
+ */
+export type ComparisonSourceRange = {
+  /** Explicit EOF preserves ranges written with earlier expansion sizes. */
+  endOfFile?: boolean;
+  id: string;
+  file: string;
+  oldFile?: string;
+  newFile?: string;
+  oldStart?: number;
+  oldLines?: string[];
+  newStart?: number;
+  newLines?: string[];
+  /** The command/revision identity used to obtain this source. */
+  sourceKey: string;
+};
+
+export type ExpandedContextRange = {
+  id: string;
+  file: string;
+  oldFile?: string;
+  newFile?: string;
+  direction: "above" | "below" | "between";
+  oldStart: number;
+  oldEnd: number;
+  newStart: number;
+  newEnd: number;
+};
+
+/** Durable metadata for one successfully rendered comparison snapshot. */
+export type ComparisonSnapshot = {
+  version: 1;
+  repository: string;
+  directory: string;
+  command: string;
+  userArgs: string[];
+  extensionArgs: string[];
+  patch: string;
+  files: ComparisonFile[];
+  expandedRanges: ExpandedContextRange[];
+  sourceRanges: ComparisonSourceRange[];
+  oldRevision?: string;
+  newRevision?: string;
+};
+
 export type Review = {
   version: 2;
   id: string;
@@ -32,6 +86,10 @@ export type Review = {
   comments: ReviewComment[];
   /** Last successfully rendered patch, retained for restart recovery. */
   patch?: string;
+  /** Selected command directory, which may differ from the repository root. */
+  directory?: string;
+  /** Last successful comparison and any bounded context loaded for it. */
+  snapshot?: ComparisonSnapshot;
   /** Internal marker used to make legacy migration idempotent after rename. */
   legacySource?: string;
 };
@@ -187,11 +245,22 @@ export async function discoverRepositories(
     } catch {
       return;
     }
-    if (!directoryInfo.isDirectory() || directoryInfo.isSymbolicLink()) {
+    // A workspace folder may itself be a symlink. Resolve that one boundary
+    // so repositories below it are discoverable, while descendants remain
+    // lstat-checked and symlinks are never followed recursively.
+    let scannedDirectory = directory;
+    if (directoryInfo.isSymbolicLink()) {
+      if (!workspaceFolder) return;
+      try {
+        scannedDirectory = await fs.realpath(directory);
+      } catch {
+        return;
+      }
+    } else if (!directoryInfo.isDirectory()) {
       return;
     }
 
-    const absoluteDirectory = resolve(directory);
+    const absoluteDirectory = resolve(scannedDirectory);
     if (visited.has(absoluteDirectory)) {
       // A workspace folder can also be reached while walking another
       // workspace folder. Preserve the contract that every supplied folder
@@ -200,7 +269,7 @@ export async function discoverRepositories(
         try {
           const repository = await rootFor(absoluteDirectory);
           if (repository) {
-            repositories.add(resolve(repository));
+            repositories.add(await canonicalPath(repository));
           }
         } catch {
           // Ignore an inaccessible workspace folder and continue the scan.
@@ -214,7 +283,7 @@ export async function discoverRepositories(
       try {
         const repository = await rootFor(absoluteDirectory);
         if (repository) {
-          repositories.add(resolve(repository));
+          repositories.add(await canonicalPath(repository));
         }
       } catch {
         // A directory can disappear or be inaccessible while a workspace is
@@ -265,6 +334,14 @@ export async function discoverRepositories(
   return Array.from(repositories).sort();
 }
 
+async function canonicalPath(value: string): Promise<string> {
+  try {
+    return await fs.realpath(value);
+  } catch {
+    return resolve(value);
+  }
+}
+
 function isObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
@@ -292,6 +369,104 @@ function assertAnchor(
     value.text.length !== end - start + 1
   ) {
     throw new Error(`${context} is not a valid review anchor`);
+  }
+}
+
+function assertStringArray(
+  value: unknown,
+  context: string,
+): asserts value is string[] {
+  if (!Array.isArray(value) || !value.every((item) => typeof item === "string"))
+    throw new Error(`${context} must be an array of strings`);
+}
+
+function assertSnapshot(
+  value: unknown,
+  context = "Review comparison snapshot",
+): asserts value is ComparisonSnapshot {
+  if (!isObject(value) || value.version !== 1)
+    throw new Error(`${context} has an invalid shape`);
+  if (
+    typeof value.repository !== "string" ||
+    typeof value.directory !== "string" ||
+    typeof value.command !== "string" ||
+    typeof value.patch !== "string"
+  )
+    throw new Error(`${context} has invalid paths or command`);
+  for (const key of ["oldRevision", "newRevision"]) {
+    if (
+      value[key] !== undefined &&
+      (typeof value[key] !== "string" ||
+        !/^[0-9a-f]{40}$/.test(value[key] as string))
+    )
+      throw new Error(`${context} has an invalid revision`);
+  }
+  assertStringArray(value.userArgs, `${context} userArgs`);
+  assertStringArray(value.extensionArgs, `${context} extensionArgs`);
+  if (!Array.isArray(value.files))
+    throw new Error(`${context} files must be an array`);
+  for (const [index, file] of value.files.entries()) {
+    if (
+      !isObject(file) ||
+      (file.oldPath !== undefined && typeof file.oldPath !== "string") ||
+      (file.newPath !== undefined && typeof file.newPath !== "string") ||
+      (file.oldPath === undefined && file.newPath === undefined)
+    )
+      throw new Error(`${context} file ${index} is invalid`);
+  }
+  if (!Array.isArray(value.expandedRanges))
+    throw new Error(`${context} expandedRanges must be an array`);
+  for (const [index, range] of value.expandedRanges.entries()) {
+    const oldStart = isObject(range) ? range.oldStart : undefined;
+    const oldEnd = isObject(range) ? range.oldEnd : undefined;
+    const newStart = isObject(range) ? range.newStart : undefined;
+    const newEnd = isObject(range) ? range.newEnd : undefined;
+    if (
+      !isObject(range) ||
+      typeof range.id !== "string" ||
+      typeof range.file !== "string" ||
+      (range.oldFile !== undefined && typeof range.oldFile !== "string") ||
+      (range.newFile !== undefined && typeof range.newFile !== "string") ||
+      !["above", "below", "between"].includes(String(range.direction)) ||
+      !Number.isSafeInteger(oldStart) ||
+      !Number.isSafeInteger(oldEnd) ||
+      !Number.isSafeInteger(newStart) ||
+      !Number.isSafeInteger(newEnd) ||
+      (oldStart as number) < 1 ||
+      (oldEnd as number) < (oldStart as number) - 1 ||
+      (newStart as number) < 1 ||
+      (newEnd as number) < (newStart as number) - 1
+    )
+      throw new Error(`${context} expanded range ${index} is invalid`);
+  }
+  if (!Array.isArray(value.sourceRanges))
+    throw new Error(`${context} sourceRanges must be an array`);
+  for (const [index, source] of value.sourceRanges.entries()) {
+    const oldStart = isObject(source) ? source.oldStart : undefined;
+    const newStart = isObject(source) ? source.newStart : undefined;
+    if (
+      !isObject(source) ||
+      typeof source.id !== "string" ||
+      typeof source.file !== "string" ||
+      (source.oldFile !== undefined && typeof source.oldFile !== "string") ||
+      (source.newFile !== undefined && typeof source.newFile !== "string") ||
+      typeof source.sourceKey !== "string" ||
+      (oldStart !== undefined &&
+        (!Number.isSafeInteger(oldStart) || (oldStart as number) < 1)) ||
+      (newStart !== undefined &&
+        (!Number.isSafeInteger(newStart) || (newStart as number) < 1))
+    )
+      throw new Error(`${context} source range ${index} is invalid`);
+    if (source.oldLines !== undefined)
+      assertStringArray(
+        source.oldLines,
+        `${context} source range ${index} oldLines`,
+      );
+    if (source.newLines !== undefined)
+      assertStringArray(
+        source.newLines,
+        `${context} source range ${index} newLines`,
+      );
   }
 }
 
@@ -335,10 +510,12 @@ function assertReview(value: unknown): asserts value is Review {
     typeof value.command !== "string" ||
     value.command.length === 0 ||
     (value.patch !== undefined && typeof value.patch !== "string") ||
+    (value.directory !== undefined && typeof value.directory !== "string") ||
     (value.legacySource !== undefined && typeof value.legacySource !== "string")
   ) {
     throw new Error("Review file has an invalid shape");
   }
+  if (value.snapshot !== undefined) assertSnapshot(value.snapshot);
   assertComments(value.comments);
 }
 
@@ -587,9 +764,23 @@ export class ReviewStore {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const filename = join(this.directory, entry.name);
-      const parsed = await this.readFile(filename);
+      let parsed;
+      try {
+        parsed = await this.readFile(filename);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.startsWith("Malformed review file:")
+        )
+          continue;
+        throw error;
+      }
       if (!isLegacy(parsed)) continue;
-      assertLegacyReview(parsed);
+      try {
+        assertLegacyReview(parsed);
+      } catch {
+        continue;
+      }
       if (parsed.repo !== repo) continue;
 
       const legacySource = legacyReviewFilename(parsed.repo, parsed.command);
@@ -689,9 +880,25 @@ export class ReviewStore {
     for (const entry of entries) {
       if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
       const filename = join(this.directory, entry.name);
-      const parsed = await this.readFile(filename);
+      let parsed;
+      try {
+        parsed = await this.readFile(filename);
+      } catch (error) {
+        if (
+          error instanceof Error &&
+          error.message.startsWith("Malformed review file:")
+        )
+          continue;
+        throw error;
+      }
       if (parsed === undefined || isLegacy(parsed)) continue;
-      assertReview(parsed);
+      // A corrupt sibling must not strand otherwise valid reviews. Direct
+      // loading still reports the error, and the original file is retained.
+      try {
+        assertReview(parsed);
+      } catch {
+        continue;
+      }
       if (parsed.repo === repo) reviews.push(parsed);
     }
     return reviews
@@ -779,6 +986,18 @@ export class ReviewStore {
     return updated;
   }
 
+  /** Persist snapshot/context changes without making the review look edited. */
+  public async saveSnapshot(
+    review: Review,
+    snapshot: ComparisonSnapshot,
+  ): Promise<Review> {
+    assertReview(review);
+    assertSnapshot(snapshot);
+    const updated = { ...review, snapshot, patch: snapshot.patch };
+    await this.writeFile(updated);
+    return updated;
+  }
+
   /**
    * Permanently remove a review file. Returns false when no persisted review
    * exists; in particular, deleting a never-saved default is a no-op and the
@@ -821,7 +1040,11 @@ function normalizeDiffPath(filename: string): string {
   return normalized;
 }
 
-function fileNamesMatch(anchor: string, diffFilename: string): boolean {
+function fileNamesMatch(
+  anchor: string,
+  diffFilename: string | undefined,
+): boolean {
+  if (diffFilename === undefined) return false;
   const wanted = normalizeDiffPath(anchor);
   const actual = normalizeDiffPath(diffFilename);
   return wanted === actual;
@@ -836,6 +1059,40 @@ function lineText(line: DiffLine): string {
   return line.content.length > 0 ? line.content.slice(1) : line.content;
 }
 
+function sourceStatus(
+  anchor: Anchor,
+  snapshot: ComparisonSnapshot,
+): "current" | "outdated" | undefined {
+  const candidate = snapshot.sourceRanges.find((range) => {
+    const matchesFile = fileNamesMatch(
+      anchor.file,
+      anchor.side === "old"
+        ? (range.oldFile ?? range.file)
+        : (range.newFile ?? range.file),
+    );
+    if (!matchesFile) return false;
+    const start = anchor.side === "old" ? range.oldStart : range.newStart;
+    const lines = anchor.side === "old" ? range.oldLines : range.newLines;
+    return (
+      start !== undefined &&
+      lines !== undefined &&
+      anchor.start >= start &&
+      anchor.end < start + lines.length
+    );
+  });
+  if (!candidate) return undefined;
+  const start =
+    anchor.side === "old" ? candidate.oldStart! : candidate.newStart!;
+  const lines =
+    anchor.side === "old" ? candidate.oldLines! : candidate.newLines!;
+  const offset = anchor.start - start;
+  return lines
+    .slice(offset, offset + anchor.text.length)
+    .every((line, index) => line === anchor.text[index])
+    ? "current"
+    : "outdated";
+}
+
 /**
  * Compare an anchor against the parsed patch. A line-number shift or changed
  * line is intentionally considered stale, even if the same text appears
@@ -844,6 +1101,7 @@ function lineText(line: DiffLine): string {
 export function commentStatus(
   anchor: Anchor,
   patch: string,
+  snapshot?: ComparisonSnapshot,
 ): "current" | "outdated" {
   let files: DiffFile[];
   try {
@@ -863,25 +1121,73 @@ export function commentStatus(
   }
 
   const lines = file.blocks.flatMap((block) => block.lines);
-  const expectedLength = anchor.end - anchor.start + 1;
-  const selected = lines.filter((line) => {
-    const number = lineNumber(line, anchor.side);
-    return (
-      number !== undefined && number >= anchor.start && number <= anchor.end
+  for (let number = anchor.start; number <= anchor.end; number++) {
+    const visible = lines.find(
+      (line) => lineNumber(line, anchor.side) === number,
     );
-  });
-  if (
-    selected.length !== expectedLength ||
-    selected.some((line, index) => {
-      const number = lineNumber(line, anchor.side);
-      return (
-        number !== anchor.start + index || lineText(line) !== anchor.text[index]
-      );
-    })
-  ) {
-    return "outdated";
+    const text = anchor.text[number - anchor.start];
+    if (visible) {
+      if (lineText(visible) !== text) return "outdated";
+    } else if (
+      !snapshot ||
+      sourceStatus(
+        { ...anchor, start: number, end: number, text: [text] },
+        snapshot,
+      ) !== "current"
+    ) {
+      return "outdated";
+    }
   }
   return "current";
+}
+
+/** Build durable file identity metadata from a parsed unified patch. */
+export function comparisonFiles(patch: string): ComparisonFile[] {
+  try {
+    return parseDiff(patch).map((file) => ({
+      ...(file.oldName ? { oldPath: normalizeDiffPath(file.oldName) } : {}),
+      ...(file.newName ? { newPath: normalizeDiffPath(file.newName) } : {}),
+    }));
+  } catch {
+    return [];
+  }
+}
+
+export function comparisonSnapshot(
+  repository: string,
+  directory: string,
+  command: string,
+  userArgs: string[],
+  extensionArgs: string[],
+  patch: string,
+): ComparisonSnapshot {
+  return {
+    version: 1,
+    repository,
+    directory,
+    command,
+    userArgs: [...userArgs],
+    extensionArgs: [...extensionArgs],
+    patch,
+    files: comparisonFiles(patch),
+    expandedRanges: [],
+    sourceRanges: [],
+  };
+}
+
+function emptySnapshot(patch: string): ComparisonSnapshot {
+  return {
+    version: 1,
+    repository: "",
+    directory: "",
+    command: "",
+    userArgs: [],
+    extensionArgs: [],
+    patch,
+    files: [],
+    expandedRanges: [],
+    sourceRanges: [],
+  };
 }
 
 function inlineCode(value: string): string {
@@ -911,7 +1217,9 @@ export function markdown(review: Review, patch: string): string {
         ? `${anchor.start}`
         : `${anchor.start}-${anchor.end}`;
     const status =
-      commentStatus(anchor, patch) === "outdated" ? " **OUTDATED**" : "";
+      commentStatus(anchor, patch, review.snapshot) === "outdated"
+        ? " **OUTDATED**"
+        : "";
     // Keep the location unadorned so it can be copied directly into an issue,
     // editor, or agent prompt as `path:line`.
     lines.push(`- ${anchor.file}:${range} (${anchor.side})${status}`);

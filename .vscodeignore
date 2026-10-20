@@ -8,5 +8,8 @@ tsconfig.json
 build.mjs
 **/*.map
 AGENTS.md
+TODO.md
+UPSTREAM_PARITY_PLAN.md
+.gitignore
 build-and-install.sh
 install-latest.py
