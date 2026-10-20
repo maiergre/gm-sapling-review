@@ -38,3 +38,12 @@
 - For an installable update, run `npm run package`. This runs type checking and builds the VSIX. Reinstall same-version builds with `code --install-extension <file>.vsix --force`, then reload VS Code.
 - Do not track `node_modules/`, `dist/`, or `*.vsix`. Track shared VS Code launch/tasks files; keep local settings ignored. Keep development files out of the VSIX via `.vscodeignore`.
 - Create temporary files inside a unique directory from `mkdtemp`/`mktemp -d`, never directly in a shared temporary directory.
+
+## Creating a GitHub release
+
+- Confirm the working copy is clean, the release version matches in `package.json` and `package-lock.json`, and the intended release commit is present on `remote/main`. Do not publish from an uncommitted or local-only revision.
+- Check that the `v<version>` tag and GitHub release do not already exist. Follow the existing convention: tag `v<version>` and release title `GM Sapling Review <version>`.
+- Run `npm run check`, `npm test`, and `npm run test:visual`, then run `npm run package` to rebuild the versioned VSIX from the release commit. Set `TMPDIR` to the session temporary root for tests that create artifacts.
+- Create release notes summarizing user-visible changes since the previous release. State the VS Code and Sapling requirements and retain the Remote SSH and reload guidance when applicable.
+- Publish the GitHub release from the verified commit with the versioned `gm-sapling-review-<version>.vsix` and `install-latest.py` assets. The installer is version-independent; obtain the validated copy from the previous release when it is unchanged.
+- After publishing, verify that the release is public (not a draft or prerelease), targets the intended commit, contains exactly the expected assets, and reports the locally calculated SHA-256 digest for each asset.
