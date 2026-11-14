@@ -208,6 +208,101 @@ test("webview renders highlighted diffs, preserves names, selects ranges, saves 
   }
 });
 
+test("clears only the active review after durable acknowledgement and keeps editor Home/End on a line", () => {
+  const b = browser();
+  try {
+    const comment = {
+      id: "clear-me",
+      anchor: {
+        file: "a/example.ts",
+        side: "new" as const,
+        start: 2,
+        end: 2,
+        text: ["const two = 3;"],
+      },
+      body: "Remove this note",
+      status: "current" as const,
+    };
+    b.state([comment], { reviewId: "review-1", reviewName: "Current" });
+    const clearButtons = () => [
+      ...b.w.document.querySelectorAll<HTMLButtonElement>(
+        ".review-clear-comments",
+      ),
+    ];
+    assert.equal(clearButtons().length, 2);
+    const clear = b.w.document.querySelector<HTMLButtonElement>(
+      "#toolbar .review-clear-comments",
+    )!;
+    assert.equal(clear.disabled, false);
+    clear.click();
+    assert.ok(clearButtons().every((button) => button.disabled));
+    assert.deepEqual(b.messages.at(-1), {
+      type: "clearComments",
+      repo: "/repo",
+      reviewId: "review-1",
+    });
+    assert.equal(
+      b.w.document.querySelectorAll(".review-comment").length,
+      1,
+      "comments remain visible until the host acknowledges durable storage",
+    );
+
+    b.w.dispatchEvent(
+      new b.w.MessageEvent("message", {
+        data: {
+          type: "commentsCleared",
+          repo: "/repo",
+          reviewId: "review-1",
+        },
+      }),
+    );
+    assert.equal(b.w.document.querySelectorAll(".review-comment").length, 0);
+    assert.ok(clearButtons().every((button) => !button.disabled));
+
+    b.line(2).querySelector<HTMLButtonElement>("button")!.click();
+    const textarea = b.w.document.querySelector<HTMLTextAreaElement>(
+      ".review-composer textarea",
+    )!;
+    textarea.value = "first line\nsecond line";
+    textarea.setSelectionRange(15, 15);
+    textarea.dispatchEvent(
+      new b.w.KeyboardEvent("keydown", { key: "Home", bubbles: true }),
+    );
+    assert.equal(textarea.selectionStart, 11);
+    textarea.dispatchEvent(
+      new b.w.KeyboardEvent("keydown", { key: "End", bubbles: true }),
+    );
+    assert.equal(textarea.selectionStart, textarea.value.length);
+    textarea.setSelectionRange(15, 15);
+    textarea.dispatchEvent(
+      new b.w.KeyboardEvent("keydown", {
+        key: "Home",
+        shiftKey: true,
+        bubbles: true,
+      }),
+    );
+    assert.equal(textarea.selectionStart, 11);
+    assert.equal(textarea.selectionEnd, 15);
+    textarea.value = "Do not resurrect this draft";
+    textarea.dispatchEvent(new b.w.Event("input"));
+    assert.deepEqual(Object.keys(b.stored().drafts ?? {}).length, 1);
+    b.button("Clear all comments").click();
+    assert.equal(b.messages.at(-1).type, "clearComments");
+    b.w.dispatchEvent(
+      new b.w.MessageEvent("message", {
+        data: {
+          type: "commentsCleared",
+          repo: "/repo",
+          reviewId: "review-1",
+        },
+      }),
+    );
+    assert.deepEqual(Object.keys(b.stored().drafts ?? {}), []);
+  } finally {
+    b.dom.window.close();
+  }
+});
+
 test("built-in diffs offer expandable context gaps in both layouts", () => {
   const b = browser();
   const expansionPatch = `diff --git a/a/example.ts b/a/example.ts
@@ -1146,9 +1241,17 @@ test("named review controls, tree navigation, persisted layout, and batch drafts
         },
       ],
       viewMode: "split",
-      patch: patch
-        .replaceAll("a/a/example.ts", "a/src/example.ts")
-        .replaceAll("b/a/example.ts", "b/docs/readme.md"),
+      patch:
+        patch
+          .replaceAll("a/a/example.ts", "a/src/example.ts")
+          .replaceAll("b/a/example.ts", "b/docs/readme.md") +
+        `diff --git a/src/extra.ts b/src/extra.ts
+--- a/src/extra.ts
++++ b/src/extra.ts
+@@ -1,1 +1,1 @@
+-const oldValue = 1;
++const newValue = 2;
+`,
     });
     const repositories =
       b.w.document.querySelector<HTMLSelectElement>("#review-repo")!;
@@ -1172,6 +1275,14 @@ test("named review controls, tree navigation, persisted layout, and batch drafts
         anchor.getAttribute("title")?.includes("/"),
       ),
     );
+    assert.equal(b.w.document.querySelectorAll(".review-toc-file a").length, 2);
+    assert.equal(
+      b.w.document.querySelectorAll(".d2h-file-header .review-back-to-top")
+        .length,
+      2,
+    );
+    b.button("Collapse all files").click();
+    assert.equal(b.w.document.querySelectorAll(".review-collapsed").length, 2);
     b.w.document
       .querySelector<HTMLButtonElement>('[data-mode="inline"]')!
       .click();

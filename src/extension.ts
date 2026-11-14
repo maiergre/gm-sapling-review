@@ -1466,6 +1466,49 @@ export function activate(context: vscode.ExtensionContext) {
               await renameReview(review);
               break;
             }
+            case "clearComments": {
+              if (
+                message.repo !== review.repo ||
+                message.reviewId !== review.id
+              )
+                return;
+              const draftCount =
+                Number.isSafeInteger(message.draftCount) &&
+                message.draftCount > 0
+                  ? message.draftCount
+                  : 0;
+              const draftSummary = draftCount
+                ? ` and ${draftCount} unsaved draft${draftCount === 1 ? "" : "s"}`
+                : "";
+              const confirmed = await vscode.window.showWarningMessage(
+                `Clear all ${review.comments.length} saved comments${draftSummary} in review “${review.name}” in ${review.repo}?`,
+                {
+                  modal: true,
+                  detail:
+                    "This clears comments only in the active review and repository. This cannot be undone.",
+                },
+                "Clear comments",
+              );
+              if (confirmed !== "Clear comments") {
+                await panel?.webview.postMessage({
+                  type: "commentsClearCancelled",
+                  repo: review.repo,
+                  reviewId: review.id,
+                });
+                return;
+              }
+              // ReviewStore.save writes and fsyncs the complete review before
+              // send() acknowledges the operation in the webview.
+              review = await store.save({ ...review, comments: [] });
+              await remember();
+              await panel?.webview.postMessage({
+                type: "commentsCleared",
+                repo: review.repo,
+                reviewId: review.id,
+              });
+              await send();
+              break;
+            }
             case "saveComment": {
               review = await store.save(applyComment(review, message));
               await send();

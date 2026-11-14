@@ -206,11 +206,15 @@ let pending = new Map<string, PendingSave>();
 let selection: Selection | undefined = restored.selection;
 let editingComment: string | undefined = restored.editingComment;
 let activeComposerKey: string | undefined = restored.activeComposerKey;
+let pendingClearScope: string | undefined;
+let pendingClearKeys = new Set<string>();
 let customCommandInput: HTMLInputElement | undefined;
 let repoSelect: HTMLSelectElement | undefined;
 let reviewSelect: HTMLSelectElement | undefined;
 let saveAllButton: HTMLButtonElement | undefined;
+let clearAllButton: HTMLButtonElement | undefined;
 let threadObserver: ResizeObserver | undefined;
+let toolbarResizeObserver: ResizeObserver | undefined;
 let hasAuthoritativeState = false;
 let legacyDraftsForeign = false;
 let reviewManager: HTMLElement | undefined;
@@ -308,6 +312,17 @@ function showInfo(message: string): void {
 
 function clearError(): void {
   if (status.dataset.kind === "error") status.dataset.kind = "info";
+}
+
+function scrollPageTo(position: "top" | "bottom"): void {
+  const top = position === "top" ? 0 : document.documentElement.scrollHeight;
+  try {
+    window.scrollTo({ top, behavior: "smooth" });
+  } catch {
+    // jsdom and older embedded webviews may not implement scrollTo options.
+  }
+  document.documentElement.scrollTop = top;
+  if (document.body) document.body.scrollTop = top;
 }
 
 // Microsoft VS Code Codicons, CC BY 4.0; attribution in README.
@@ -822,6 +837,8 @@ function buildToolbar(): void {
     "review-save-all-button",
   );
   actionRow.append(saveAllButton);
+  clearAllButton = makeClearCommentsButton();
+  actionRow.append(clearAllButton);
 
   const viewGroup = document.createElement("span");
   viewGroup.className = "review-view-toggle";
@@ -2063,13 +2080,33 @@ function renderDiff(): void {
     return;
   }
 
+  let wrappers: HTMLElement[] = [];
   const toc = document.createElement("nav");
   toc.className = "review-toc";
   toc.setAttribute("aria-label", "Files changed");
+  const tocHeader = document.createElement("div");
+  tocHeader.className = "review-toc-header";
   const tocHeading = document.createElement("span");
   tocHeading.className = "review-toc-heading";
   tocHeading.textContent = "Files changed";
-  toc.append(tocHeading);
+  const collapseAll = makeButton(
+    "Collapse all files",
+    () => {
+      for (const wrapper of wrappers) {
+        const key = wrapper.dataset.reviewFileKey;
+        if (key) collapsed.add(key);
+        const toggle = wrapper.querySelector<HTMLButtonElement>(
+          ".review-file-toggle",
+        );
+        if (key && toggle) applyCollapsed(wrapper, toggle, key);
+      }
+      persist();
+    },
+    "review-collapse-all",
+  );
+  collapseAll.title = "Collapse every file in this diff";
+  tocHeader.append(tocHeading, collapseAll);
+  toc.append(tocHeader);
   const tocList = document.createElement("ol");
   tocList.className = "review-toc-list";
   toc.append(tocList);
@@ -2132,9 +2169,7 @@ function renderDiff(): void {
     return;
   }
 
-  const wrappers = [
-    ...output.querySelectorAll<HTMLElement>(".d2h-file-wrapper"),
-  ];
+  wrappers = [...output.querySelectorAll<HTMLElement>(".d2h-file-wrapper")];
   const tocRoot: TocDirectory = { directories: new Map(), files: [] };
   wrappers.forEach((wrapper, index) => {
     const sourceFile = files[index];
@@ -2176,6 +2211,16 @@ function renderDiff(): void {
     directory.files.push({ name, wrapper, index });
   });
   appendTocDirectory(tocList, tocRoot);
+
+  for (const wrapper of wrappers) {
+    const key = wrapper.dataset.reviewFileKey;
+    if (key && collapsed.has(key)) {
+      const toggle = wrapper.querySelector<HTMLButtonElement>(
+        ".review-file-toggle",
+      );
+      if (toggle) applyCollapsed(wrapper, toggle, key);
+    }
+  }
 
   if (!wrappers.length) {
     const empty = document.createElement("div");
@@ -2235,6 +2280,7 @@ function decorateFileHeader(
 
   const renderedName = header.querySelector<HTMLElement>(".d2h-file-name");
   if (renderedName) {
+    renderedName.classList.add("review-file-header-name");
     renderedName.textContent = fileDisplayName(file) || name;
     renderedName.title = fileDisplayName(file) || name;
   }
@@ -2250,6 +2296,14 @@ function decorateFileHeader(
   });
   header.prepend(toggle);
   applyCollapsed(wrapper, toggle, key);
+  const backToTop = makeButton(
+    "Back to top",
+    () => {
+      scrollPageTo("top");
+    },
+    "review-back-to-top",
+  );
+  header.append(backToTop);
 }
 
 function applyCollapsed(
@@ -2644,6 +2698,88 @@ function saveAllComments(): void {
   renderComments();
 }
 
+function currentReviewDraftKeys(scope = currentReviewScope()): Set<string> {
+  const keys = new Set<string>();
+  if (!scope) return keys;
+  const commentKeys = new Set(
+    (review.comments ?? []).map((comment) => `comment:${comment.id}`),
+  );
+  for (const key of Object.keys(drafts)) {
+    if (
+      draftScopes[key] === scope ||
+      key.startsWith(`new:${scope}:`) ||
+      commentKeys.has(key)
+    )
+      keys.add(key);
+  }
+  for (const [key, operation] of pending) {
+    if (operation.scope === scope || commentKeys.has(key)) keys.add(key);
+  }
+  return keys;
+}
+
+function clearLocalReviewState(scope: string, keys: Set<string>): void {
+  const allKeys = new Set([...keys, ...currentReviewDraftKeys(scope)]);
+  for (const key of allKeys) {
+    delete drafts[key];
+    delete draftAnchors[key];
+    delete draftScopes[key];
+    pending.delete(key);
+  }
+  for (const [key, operation] of pending) {
+    if (operation.scope === scope) pending.delete(key);
+  }
+  if (
+    activeComposerKey &&
+    (allKeys.has(activeComposerKey) ||
+      activeComposerKey.startsWith(`new:${scope}:`))
+  )
+    activeComposerKey = undefined;
+  selection = undefined;
+  editingComment = undefined;
+  pendingClearScope = undefined;
+  pendingClearKeys.clear();
+  persist();
+}
+
+function makeClearCommentsButton(): HTMLButtonElement {
+  const button = makeButton(
+    "Clear all comments",
+    () => clearCurrentComments(),
+    "review-clear-comments review-danger-action",
+  );
+  button.title = "Clear all comments in the current review";
+  button.disabled =
+    !currentReviewScope() || pendingClearScope === currentReviewScope();
+  return button;
+}
+
+function clearCurrentComments(): void {
+  syncDraftInputs();
+  const scope = currentReviewScope();
+  if (!scope) {
+    showError("Choose a review before clearing comments.");
+    return;
+  }
+  if (pendingClearScope === scope) return;
+  const keys = currentReviewDraftKeys(scope);
+  if (!(review.comments?.length ?? 0) && !keys.size) {
+    showInfo("There are no comments in this review.");
+    return;
+  }
+  pendingClearScope = scope;
+  pendingClearKeys = keys;
+  persist();
+  send({
+    type: "clearComments",
+    repo: review.repo,
+    reviewId: review.reviewId,
+    ...(keys.size ? { draftCount: keys.size } : {}),
+  });
+  showInfo("Clearing comments… Waiting for durable storage.");
+  renderComments();
+}
+
 function deleteComment(comment: ReviewComment): void {
   const key = `comment:${comment.id}`;
   if (pending.has(key)) return;
@@ -2930,6 +3066,9 @@ function renderComments(): void {
   count.className = "review-comment-count";
   count.textContent = String(review.comments?.length ?? 0);
   heading.append(count);
+  const clear = makeClearCommentsButton();
+  if (clearAllButton) clearAllButton.disabled = clear.disabled;
+  heading.append(clear);
 
   const content = document.createDocumentFragment();
   content.append(heading);
@@ -3468,6 +3607,8 @@ function onState(message: ReviewStateMessage): void {
     exhaustedContextRegions.clear();
     contextExpansionErrors.clear();
     pendingContextExpansion = undefined;
+    pendingClearScope = undefined;
+    pendingClearKeys.clear();
   } else if (hasSnapshotPatch) {
     // A snapshot is authoritative. Rebuild the visible patch from its base
     // patch and source rows below so a refresh cannot retain rows from the
@@ -3574,6 +3715,40 @@ function onState(message: ReviewStateMessage): void {
   }
 }
 
+function onCommentsClearCancelled(message: {
+  repo?: string;
+  reviewId?: string;
+}): void {
+  if (
+    message.repo !== review.repo ||
+    (message.reviewId && message.reviewId !== review.reviewId)
+  )
+    return;
+  pendingClearScope = undefined;
+  pendingClearKeys.clear();
+  persist();
+  showInfo("Comments were not cleared.");
+  renderComments();
+}
+
+function onCommentsCleared(message: {
+  repo?: string;
+  reviewId?: string;
+}): void {
+  const scope = currentReviewScope();
+  if (
+    !scope ||
+    message.repo !== review.repo ||
+    message.reviewId !== review.reviewId ||
+    pendingClearScope !== scope
+  )
+    return;
+  clearLocalReviewState(scope, pendingClearKeys);
+  review = { ...review, comments: [] };
+  showInfo("Comments cleared and saved.");
+  renderComments();
+}
+
 function onReviewsDeleted(message: { repo?: string; ids?: string[] }): void {
   const scopes = new Set(
     (message.ids ?? []).map((id) => reviewScope(message.repo, id)),
@@ -3592,10 +3767,84 @@ function onReviewsDeleted(message: { repo?: string; ids?: string[] }): void {
     selection = undefined;
     activeComposerKey = undefined;
     editingComment = undefined;
+    pendingClearScope = undefined;
+    pendingClearKeys.clear();
   }
   persist();
   renderComments();
 }
+
+function updateStickyToolbarOffset(): void {
+  const height = toolbar.getBoundingClientRect().height;
+  document.documentElement.style.setProperty(
+    "--review-toolbar-height",
+    `${Math.max(0, height)}px`,
+  );
+}
+
+function isEditableTarget(target: EventTarget | null): boolean {
+  return (
+    target instanceof Element &&
+    !!target.closest("textarea, input, [contenteditable='true']")
+  );
+}
+
+function moveTextareaToLineEdge(
+  textarea: HTMLTextAreaElement,
+  key: "Home" | "End",
+  extend: boolean,
+): void {
+  const value = textarea.value;
+  const direction = textarea.selectionDirection;
+  const anchor =
+    direction === "backward" ? textarea.selectionEnd : textarea.selectionStart;
+  const caret =
+    direction === "backward" ? textarea.selectionStart : textarea.selectionEnd;
+  const lineStart = caret === 0 ? 0 : value.lastIndexOf("\n", caret - 1) + 1;
+  const newline = value.indexOf("\n", caret);
+  const lineEnd = newline < 0 ? value.length : newline;
+  const destination = key === "Home" ? lineStart : lineEnd;
+  if (extend) {
+    const start = Math.min(anchor, destination);
+    const end = Math.max(anchor, destination);
+    textarea.setSelectionRange(
+      start,
+      end,
+      destination < anchor ? "backward" : "forward",
+    );
+  } else {
+    textarea.setSelectionRange(destination, destination);
+  }
+}
+
+window.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented) return;
+  if (event.target instanceof HTMLTextAreaElement) {
+    if (
+      (event.key === "Home" || event.key === "End") &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey
+    ) {
+      event.preventDefault();
+      moveTextareaToLineEdge(event.target, event.key, event.shiftKey);
+    }
+    return;
+  }
+  if (isEditableTarget(event.target)) return;
+  if (
+    event.target instanceof Element &&
+    event.target.closest("select, button, a, [role='dialog']")
+  )
+    return;
+  if (event.key === "Home") {
+    event.preventDefault();
+    scrollPageTo("top");
+  } else if (event.key === "End") {
+    event.preventDefault();
+    scrollPageTo("bottom");
+  }
+});
 
 window.addEventListener("message", (event) => {
   const message = event.data as
@@ -3603,6 +3852,8 @@ window.addEventListener("message", (event) => {
     | ContextExpandedMessage
     | ContextErrorMessage
     | { type: "error"; message?: string }
+    | { type: "commentsClearCancelled"; repo?: string; reviewId?: string }
+    | { type: "commentsCleared"; repo?: string; reviewId?: string }
     | { type: "reviewsDeleted"; repo?: string; ids?: string[] }
     | undefined;
   if (!message || typeof message.type !== "string") return;
@@ -3610,11 +3861,16 @@ window.addEventListener("message", (event) => {
   else if (message.type === "contextExpanded") onContextExpanded(message);
   else if (message.type === "contextError") onContextError(message);
   else if (message.type === "reviewsDeleted") onReviewsDeleted(message);
+  else if (message.type === "commentsClearCancelled")
+    onCommentsClearCancelled(message);
+  else if (message.type === "commentsCleared") onCommentsCleared(message);
   else if (message.type === "error") {
     for (const [key, operation] of pending) {
       if (!operation.scope || operation.scope === currentReviewScope())
         pending.delete(key);
     }
+    pendingClearScope = undefined;
+    pendingClearKeys.clear();
     persist();
     showError(
       message.message ||
@@ -3625,5 +3881,11 @@ window.addEventListener("message", (event) => {
 });
 
 buildToolbar();
+updateStickyToolbarOffset();
+if (typeof ResizeObserver !== "undefined") {
+  toolbarResizeObserver = new ResizeObserver(updateStickyToolbarOffset);
+  toolbarResizeObserver.observe(toolbar);
+}
+window.addEventListener("resize", updateStickyToolbarOffset);
 renderDiff();
 send({ type: "ready" });

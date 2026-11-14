@@ -824,6 +824,46 @@ test("activation persists custom review comments, runs custom diff arguments exp
       restoredState?.comments?.[0]?.body,
       "Please keep this behavior.",
     );
+    const clearWindow = host.vscode.window as any;
+    let clearConfirmations = 0;
+    clearWindow.showWarningMessage = async (message: string, options: any) => {
+      assert.match(message, /Clear all 3 saved comments/);
+      assert.ok(message.includes(repo));
+      assert.equal(options.modal, true);
+      clearConfirmations += 1;
+      return undefined;
+    };
+    const restoredLatest = () =>
+      restored.webview.messages
+        .filter((message: any) => message.type === "state")
+        .at(-1) as any;
+    restored.webview.emit({
+      type: "clearComments",
+      repo,
+      reviewId: restoredLatest().reviewId,
+    });
+    await waitFor(() => clearConfirmations === 1);
+    assert.equal(
+      restoredLatest().comments.length,
+      3,
+      "cancel keeps saved comments",
+    );
+    clearWindow.showWarningMessage = async () => "Clear comments";
+    restored.webview.emit({
+      type: "clearComments",
+      repo,
+      reviewId: restoredLatest().reviewId,
+    });
+    await waitFor(
+      () =>
+        restoredLatest().comments.length === 0 &&
+        restored.webview.messages.some(
+          (message: any) =>
+            message.type === "commentsCleared" &&
+            message.repo === repo &&
+            message.reviewId === restoredLatest().reviewId,
+        ),
+    );
     restored.dispose();
     const legacyCommand = "sl diff --rev legacy";
     const legacyPath = path.join(

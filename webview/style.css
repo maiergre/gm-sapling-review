@@ -1,5 +1,6 @@
 :root {
   color-scheme: light dark;
+  --review-toolbar-height: 0px;
   --review-border: var(
     --vscode-panel-border,
     var(--vscode-editorWidget-border, #8b949e55)
@@ -244,6 +245,16 @@ button:disabled {
   background: var(--review-surface-raised);
 }
 
+.review-toc-header {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.review-toc-header .review-collapse-all {
+  margin-left: auto;
+}
+
 .review-toc > summary,
 .review-toc-summary {
   display: flex;
@@ -288,6 +299,17 @@ button:disabled {
 
 .review-toc-list li {
   min-width: 0;
+}
+
+.review-toc-file a,
+.review-toc-list summary {
+  font-family: var(
+    --vscode-editor-font-family,
+    ui-monospace,
+    SFMono-Regular,
+    Consolas,
+    monospace
+  );
 }
 
 .review-toc-list details {
@@ -474,10 +496,13 @@ a {
   scroll-margin-top: 7rem;
   margin-bottom: 1.1rem;
   border-radius: 4px;
-  overflow: hidden;
+  overflow: visible;
 }
 
 .d2h-file-header {
+  position: sticky;
+  top: var(--review-toolbar-height, 0px);
+  z-index: 10;
   align-items: center;
   gap: 0.45rem;
   height: auto;
@@ -487,11 +512,20 @@ a {
   font-family: inherit;
 }
 
+.d2h-file-header.d2h-sticky-header {
+  top: var(--review-toolbar-height, 0px);
+}
+
 .d2h-file-name-wrapper {
   min-width: 0;
 }
 .d2h-file-name {
   color: var(--review-fg);
+}
+
+.d2h-file-header .review-file-header-name {
+  font-size: 1.08em;
+  font-weight: 700;
 }
 .d2h-tag {
   border-radius: 3px;
@@ -540,7 +574,7 @@ a {
   position: static;
   direction: ltr;
   width: 1%;
-  padding: 0 6px;
+  padding: 0 3px;
   white-space: nowrap;
   overflow: visible;
   text-overflow: clip;
@@ -557,9 +591,9 @@ a {
   float: none;
   display: inline-block;
   position: relative;
-  width: calc(6ch + 18px);
-  min-width: calc(6ch + 18px);
-  padding: 0 18px 0 0;
+  width: calc(4ch + 18px);
+  min-width: calc(4ch + 18px);
+  padding: 0;
   overflow: visible;
   text-overflow: clip;
   text-align: right;
@@ -568,8 +602,8 @@ a {
 .d2h-code-side-linenumber {
   /* Position the comment button without changing the cell's table layout. */
   position: relative;
-  min-width: calc(6ch + 24px);
-  padding-right: 24px;
+  min-width: calc(4ch + 1.35rem);
+  padding-right: 1.35rem;
   text-align: right;
 }
 .d2h-code-line,
@@ -604,7 +638,7 @@ a {
 }
 
 .review-context-expansion-gutter {
-  min-width: calc(6ch + 24px);
+  min-width: calc(4ch + 1.35rem);
   padding: 0 0.15rem !important;
   text-align: center;
   white-space: nowrap;
@@ -796,6 +830,21 @@ a {
   background: var(--review-selected);
 }
 
+.review-back-to-top {
+  flex: 0 0 auto;
+  min-width: 1.8rem;
+  margin-left: 0.25rem;
+  padding: 0.15rem 0.35rem;
+  border: 0;
+  background: transparent;
+  color: var(--review-muted);
+}
+
+.review-back-to-top:hover {
+  background: var(--review-selected);
+  color: var(--review-fg);
+}
+
 .review-collapsed .d2h-file-diff,
 .review-collapsed .d2h-files-diff {
   display: none;
@@ -843,6 +892,15 @@ a {
 .review-comments-heading h2 {
   margin: 0 0 0.45rem;
   font-size: 1.05rem;
+}
+
+.review-comments-heading .review-clear-comments {
+  margin-left: auto;
+}
+
+.review-danger-action {
+  border-color: color-mix(in srgb, var(--review-danger) 48%, transparent);
+  color: var(--review-danger);
 }
 
 .review-comment-count {

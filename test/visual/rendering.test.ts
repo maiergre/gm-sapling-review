@@ -42,6 +42,13 @@ diff --git a/docs/REVIEW.md b/docs/REVIEW.md
  
  Trailing context
 `;
+const visualPatch = `${patch}diff --git a/notes.txt b/notes.txt
+--- a/notes.txt
++++ b/notes.txt
+@@ -1,1 +1,100 @@
+-old note
+${Array.from({ length: 100 }, (_, index) => `+tail line ${index + 1}`).join("\n")}
+`;
 
 const comments = [
   {
@@ -103,7 +110,7 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
         colorScheme: theme === "dark" ? "light" : "dark",
       });
       await page.setContent(
-        `<body class="vscode-${theme}" style="--vscode-editor-background:${theme === "dark" ? "#1e1e1e" : "#ffffff"};--vscode-editor-foreground:${theme === "dark" ? "#d4d4d4" : "#24292e"};--vscode-descriptionForeground:${theme === "dark" ? "#aaaaaa" : "#555555"};--vscode-sideBar-background:${theme === "dark" ? "#252526" : "#f3f3f3"};--vscode-editorWidget-background:${theme === "dark" ? "#252526" : "#f3f3f3"};--vscode-panel-border:${theme === "dark" ? "#3c3c3c" : "#dddddd"};--vscode-font-family:Arial;--vscode-font-size:13px;--vscode-editor-font-size:13px"><div id="toolbar"></div><div id="status"></div><main id="diff"></main><section id="comments"></section></body>`,
+        `<!doctype html><body class="vscode-${theme}" style="--vscode-editor-background:${theme === "dark" ? "#1e1e1e" : "#ffffff"};--vscode-editor-foreground:${theme === "dark" ? "#d4d4d4" : "#24292e"};--vscode-descriptionForeground:${theme === "dark" ? "#aaaaaa" : "#555555"};--vscode-sideBar-background:${theme === "dark" ? "#252526" : "#f3f3f3"};--vscode-editorWidget-background:${theme === "dark" ? "#252526" : "#f3f3f3"};--vscode-panel-border:${theme === "dark" ? "#3c3c3c" : "#dddddd"};--vscode-font-family:Arial;--vscode-font-size:13px;--vscode-editor-font-size:13px"><div id="toolbar"></div><div id="status"></div><main id="diff"></main><section id="comments"></section></body>`,
       );
       await page.evaluate(() =>
         document.documentElement.setAttribute(
@@ -134,7 +141,7 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
               },
             }),
           ),
-        { patch, comments, reviewState },
+        { patch: visualPatch, comments, reviewState },
       );
       for (const layout of ["Inline", "Side by side"]) {
         await page.getByRole("button", { name: layout, exact: true }).click();
@@ -363,6 +370,45 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
             contextRows,
           };
         });
+        const stickyHeaders = await page.evaluate(() => {
+          const wrappers = [
+            ...document.querySelectorAll<HTMLElement>(".d2h-file-wrapper"),
+          ];
+          const toolbar = document.querySelector<HTMLElement>("#toolbar")!;
+          const first =
+            wrappers[0]?.querySelector<HTMLElement>(".d2h-file-header");
+          const second =
+            wrappers[1]?.querySelector<HTMLElement>(".d2h-file-header");
+          if (!first || !second)
+            return {
+              position: "",
+              top: 0,
+              toolbarHeight: 0,
+              firstBottom: 0,
+            };
+          const toolbarHeight = toolbar.getBoundingClientRect().height;
+          const originalScrollY = window.scrollY;
+          const target =
+            second.getBoundingClientRect().top +
+            originalScrollY -
+            toolbarHeight +
+            50;
+          window.scrollTo(0, Math.max(0, target));
+          if (document.scrollingElement)
+            document.scrollingElement.scrollTop = Math.max(0, target);
+          const firstBottom = first.getBoundingClientRect().bottom;
+          const secondRect = second.getBoundingClientRect();
+          const position = getComputedStyle(second).position;
+          window.scrollTo(0, originalScrollY);
+          if (document.scrollingElement)
+            document.scrollingElement.scrollTop = originalScrollY;
+          return {
+            position,
+            top: secondRect.top,
+            toolbarHeight,
+            firstBottom,
+          };
+        });
         await page.screenshot({
           path: join(
             artifacts,
@@ -371,6 +417,15 @@ test("real browser: readable themed diffs and aligned four-digit gutters in both
           fullPage: true,
         });
         assert.ok(metrics.rowHeight <= 24, `row height ${metrics.rowHeight}`);
+        assert.equal(stickyHeaders.position, "sticky");
+        assert.ok(
+          Math.abs(stickyHeaders.top - stickyHeaders.toolbarHeight) < 2,
+          `current file header top ${stickyHeaders.top} should follow toolbar ${stickyHeaders.toolbarHeight}`,
+        );
+        assert.ok(
+          stickyHeaders.firstBottom <= stickyHeaders.toolbarHeight + 2,
+          "the previous file header must leave when the next file is current",
+        );
         assert.equal(metrics.repoValue, reviewState.repo);
         assert.equal(metrics.reviewValue, reviewState.reviewId);
         assert.match(metrics.reviewOptionText, /Release review/);
