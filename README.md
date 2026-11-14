@@ -20,7 +20,7 @@ npm run check
 npm test
 npm run build
 npm run package
-code --install-extension gm-sapling-review-0.1.3.vsix --force
+code --install-extension gm-sapling-review-0.1.4.vsix --force
 ```
 
 For subsequent local updates, run `./build-and-install.sh`. It packages the current version and installs it into VS Code with `--force`; run `npm ci` first on a fresh checkout. Then run **Developer: Reload Window** in VS Code. The script can be invoked from any working directory.
@@ -55,7 +55,7 @@ Saved comments, the last successful four-line diff snapshot, resolved historical
 
 Existing command-keyed reviews are imported automatically. Uncommitted reviews become Default where possible; other comparisons appear as “Imported: <command>”. Original files are retained and imports are idempotent, so repeated starts and renaming imported reviews do not duplicate comments.
 
-The extension version stays at **0.1.3** during these iterations. Reinstall the rebuilt VSIX with `--force`, then run **Developer: Reload Window**.
+The extension version stays at **0.1.4** during these iterations. Reinstall the rebuilt VSIX with `--force`, then run **Developer: Reload Window**.
 
 Refreshing compares each comment's original source text against the same side and line range of the new comparison, loading comment-bearing context ranges when they are outside the four-line patch. Changed, moved, or missing ranges are marked **outdated**, including comments on files no longer present. This deliberately conservative check does not silently relocate comments. Preset diffs refresh on editor saves; use **Refresh** for external changes and custom commands.
 
